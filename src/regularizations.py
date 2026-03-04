@@ -299,14 +299,86 @@ def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
 # the Morozovs discrepency principle since the data is synthetic
 # and the noise level is consequently known
     
-def choose_alpha_morozov(solver, A, data, delta, 
-                         alpha_lo = 1e-8,
-                         alpha_hi = 1e2, 
-                         max_expand = 30,
-                         max_bisect = 40, 
-                         rtol = 1e-2,
-                         atol = 0.0,
+def choose_alpha_morozov(reconstruct, A, data, delta, 
+                         alpha_lo = 1e-8, alpha_hi = 1e2, 
+                         max_expand = 30, max_iter = 40, 
+                         rtol = 1e-2, atol = 0.0,
                          logspace = True, 
-                         x0 = None, 
-                         callback = None, 
                          return_full = False):
+    
+    if delta <= 0:
+        raise ValueError("delta must be positive")
+    
+    # Helpers 
+    def get_x(alpha):   # for functions returning two arguments (e.g., TGV, assume first is reconstruction)
+        out = reconstruct(alpha)
+        return out[0] if isinstance(out, (tuple, list)) else out
+    
+    def residual(alpha):
+        x = get_x(alpha)
+        r = A(x) - data
+        # ODL elements have .norm(); numpy arrays use np.linalg.norm
+        res = float(r.norm() if hasattr(r, "norm") else np.linalg.norm(r))
+        return x, res
+    
+    x_lo, r_lo = residual(alpha_lo)
+    x_hi, r_hi = residual(alpha_hi)
+    hist = [(alpha_lo, r_lo), (alpha_hi, r_hi)]
+    
+    # shift the residual landscape s.t. r_lo <= delta <= r_hi
+    steps = 0
+    while not (r_lo <= delta <= r_hi) and steps < max_expand:
+        steps += 1
+        if r_lo > delta:
+            # reset ceiling
+            alpha_hi, x_hi, r_hi = alpha_lo, x_lo, r_lo
+            # lower current lowest alpha by 1 magnitude (for log-space)
+            alpha_lo /= 10
+            # compute new low
+            x_lo, r_lo = residual(alpha_lo)
+            hist.append((alpha_lo, r_lo))
+        else:   # r_hi < delta
+            # reset floor
+            alpha_lo, x_lo, r_lo = alpha_hi, x_hi, r_hi
+            # increase current highest alpha by 1 magnitude (for log-space)
+            alpha_hi *= 10
+            # compute new high
+            x_hi, r_hi = residual(alpha_hi)
+            hist.append((alpha_hi, r_hi))
+        
+    if not (r_lo <= delta <= r_hi):
+        raise RuntimeError(
+            f"Could not find $\delta$={delta:.6g}"
+            f"Got r_lo={r_lo:.6g} at $\alpha$={alpha_lo:.3g}, r_hi={r_hi:.6g} at $\alpha$={alpha_hi:.3g}."
+        )
+    
+    # Bisect to find optimal
+    alpha_star, x_star, r_star = None, None, None
+    
+    for _ in range(max_iter):
+        # in log-space: (log(a)+log(b))/2 = log(sqrt(ab))
+        alpha_mid = float(np.sqrt(alpha_lo * alpha_hi)) if logspace else 0.5 * (alpha_hi + alpha_lo)
+        x_mid, r_mid = residual(alpha_mid)
+        hist.append((alpha_mid, r_mid))
+        
+        alpha_star, x_star, r_star = alpha_mid, x_mid, r_mid
+        
+        if abs(r_mid - delta) <= atol + rtol * delta:
+            break
+        
+        if r_mid < delta:
+            alpha_lo, x_lo, r_lo = alpha_mid, x_mid, r_mid
+        else:
+            alpha_hi, x_hi, r_hi = alpha_mid, x_mid, r_mid
+        
+    if return_full:
+        info = {
+            "history": hist,
+            "delta": float(delta), 
+            "alpha_star": float(alpha_star), 
+            "res_star": float(r_star)
+        }
+        return alpha_star, x_star, info
+    
+    return alpha_star, x_star
+        

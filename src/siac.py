@@ -99,7 +99,7 @@ def _siac_freq_response_1d(N: int, d: float, moments: int, BSorder: int, cgam: n
 
 def apply_siac_fft_nd(arr: np.ndarray,
                       h_per_axis,
-                      moments: int = 6,
+                      moments: int = 2,
                       BSorder: int = 2,
                       axes=(0, 1),
                       pad_mode: str = "reflect"):

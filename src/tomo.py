@@ -154,3 +154,9 @@ def add_gaussian_noise(sino, A, I0=2e4,
 
     return sino_noisy
 
+def add_relative_gaussian_noise(data, rel_level=0.01, seed=0):
+    noise = white_noise(data.space, mean=0.0, stddev=1.0, seed=seed)
+    noise = noise / noise.norm()
+    noise = noise * rel_level * data.norm()
+    return data + noise
+

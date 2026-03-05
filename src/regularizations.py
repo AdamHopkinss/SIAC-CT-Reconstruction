@@ -40,7 +40,46 @@ def solve_tikhonov(A, data, alpha, L=None, niter=50, x0=None, callback=None):
     odl.solvers.conjugate_gradient(H, x, b, niter=niter, callback=callback)
     return x
 
-def solve_siac(A, data, alpha, K, niter=50, x0=None, callback=None):
+from src.siac import siac_cgam, siac_hat_1d
+
+def make_siac_operator_odl(space, moments=2, BSorder=2):
+    r"""
+    Construct the SIAC operator K: space -> space as an ODL Fourier-multiplier
+    Kx = IFFT( Khat * FFT(x) )
+    
+    Notes: 
+    This correpsonds to periodic convolution on the discrete grid.
+    The problem is to mimic the reflect-padding behavior, then we would have to
+    pad/crop outside the operator, or use some different construction (but then teh adjoint is non-trivial).
+    """
+    fft = odl.trafos.FourierTransform(space)
+    ifft = fft.inverse
+    
+    dx, dy = map(float, space.cell_sides)   # grid spacing
+    
+    # SIAC cosine coefficients
+    cgam = siac_cgam(moments=moments, BSorder=BSorder)
+    
+    # Build Khat on the Fourier grid
+    pts = fft.range.grid.points()
+    wx = pts[:, 0].reshape(fft.range.shape) # radian frequencies in x
+    wy = pts[:, 1].reshape(fft.range.shape) # radian frequencies in y
+    
+    Khatx = siac_hat_1d(omega=wx,cgam=cgam, BSorder=BSorder, h=dx)
+    Khaty = siac_hat_1d(omega=wy,cgam=cgam, BSorder=BSorder, h=dy)
+    
+    # Seperable 2D response
+    Khat = (Khatx * Khaty).astype(np.complex64)
+    
+    assert Khat.shape == fft.range.shape
+    
+    # ODL operators
+    mult = odl.MultiplyOperator(fft.range.element(Khat))
+    K = odl.RealPart(space) * ifft * mult * fft
+    return K
+
+
+def solve_siac(A, data, alpha, moments=2, BSorder=2, niter=50, x0=None, callback=None):
     r"""
     Solve the SIAC-regularized least squares problem
 
@@ -72,10 +111,14 @@ def solve_siac(A, data, alpha, K, niter=50, x0=None, callback=None):
         Reconstructed solution.
     """
     X = A.domain
+    # Create the operator K
+    K = make_siac_operator_odl(space=X, moments=moments, BSorder=BSorder)
+    
     I = odl.IdentityOperator(X)
     B = I - K
     H = A.adjoint*A + alpha*(B.adjoint*B)
     b = A.adjoint(data)
+    
     x = X.zero() if x0 is None else x0.copy()
     odl.solvers.conjugate_gradient(H, x, b, niter=niter, callback=callback)
     return x
@@ -90,6 +133,68 @@ BSD-3-Clause License.
 
 Modified and refactored for MSc Thesis (Adam Hopkins, 2026).
 """
+
+
+import odl
+from odl.solvers.functional.functional import Functional
+
+
+class _ShiftedL2NormSquaredConj(Functional):
+    r"""F*(p) = 0.5||p||^2 + <p, data>.
+
+    Prox:
+        prox_{sigma F*}(p) = (p - sigma*data) / (1 + sigma)
+
+    IMPORTANT:
+    ODL's PDHG expects proximal factories to return an odl.Operator (with
+    .domain/.range), not a plain Python callable.
+    """
+
+    def __init__(self, space, data):
+        super().__init__(space, linear=False)
+        self.data = data
+
+    def __call__(self, p):
+        return 0.5 * p.inner(p) + p.inner(self.data)
+
+    @property
+    def proximal(self):
+        data = self.data
+        space = self.domain
+
+        def prox_factory(sigma):
+            # prox(p) = (p - sigma*data)/(1+sigma) = a*p + c
+            a = 1.0 / (1.0 + sigma)
+            c = (-sigma * a) * data
+
+            # Return an ODL operator (affine map = scaling + constant shift)
+            return odl.ScalingOperator(space, a) + odl.ConstantOperator(c, domain=space)
+
+        return prox_factory
+
+
+class ShiftedL2NormSquared(Functional):
+    r"""F(y) = 0.5 * ||y - data||^2.
+
+    Why:
+    ODL 0.8.3 can fail for `0.5*L2NormSquared(space).translated(data)` in PDHG
+    (translation-related prox path). We keep the same fidelity but implement
+    the conjugate prox in closed form.
+    """
+
+    def __init__(self, space, data):
+        super().__init__(space, linear=False)
+        self.data = data
+        self._conj = _ShiftedL2NormSquaredConj(space, data)
+
+    def __call__(self, y):
+        d = y - self.data
+        return 0.5 * d.inner(d)
+
+    @property
+    def convex_conj(self):
+        # PDHG calls g.convex_conj.proximal, so we must return a Functional here.
+        return self._conj
 
 
 def solve_tv(A, data, alpha=1e-2, niter=200, x0=None, isotropic=True, 
@@ -149,16 +254,20 @@ def solve_tv(A, data, alpha=1e-2, niter=200, x0=None, isotropic=True,
     # We form K(x) = [A x, G x]
     op = odl.BroadcastOperator(A, G)
     
-    f = odl.functionals.ZeroFunctional(X)
+    # l2 = 0.5 * odl.solvers.L2NormSquared(A.range).translated(data)
     
-    l2 = 0.5 * odl.functionals.L2NormSquared(A.range).translated(data)
+    # NOTE: Avoid ODL's `.translated(data)` quadratic prox (can type-error in 0.8.3).
+    # This is the same data fidelity: 0.5*||Ax - data||^2, but with a safe closed-form prox of the conjugate.
+    l2 = ShiftedL2NormSquared(A.range, data)
+    
+    f = odl.solvers.ZeroFunctional(X)
 
     # TV functional (Isotropic or Anisotropic)
     if isotropic:
-        tv = 0.5 * alpha * odl.functionals.GroupL1Norm(V)
+        tv = 0.5 * alpha * odl.solvers.GroupL1Norm(V)
     else:
-        tv = 0.5 * alpha * odl.functionals.L1Norm(V)
-    g = odl.functionals.SeperableSum(l2, tv)
+        tv = 0.5 * alpha * odl.solvers.L1Norm(V)
+    g = odl.solvers.SeparableSum(l2, tv)
     
     # Step sizes
     if op_norm is None:
@@ -170,11 +279,11 @@ def solve_tv(A, data, alpha=1e-2, niter=200, x0=None, isotropic=True,
     if sigma is None:
         sigma = 1.0 / op_norm
     
-    x = X.zero() if x0 is None else x0.copy()
+    x = op.domain.zero() if x0 is None else x0.copy()
     
     odl.solvers.pdhg(x, f, g, op, niter=niter, tau=tau, sigma=sigma, callback=callback)
     
-    return X
+    return x
 
 
 def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
@@ -245,7 +354,7 @@ def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
     # Symmetrized gradient E acting on vector fields y=(y1,y2).
     # Workaround used in the ODL example: duplicate the shear component
     # to emulate weighting (since weighted product space wasn't supported there).
-    E = odl.core.operator.ProductSpaceOperator(
+    E = odl.operator.ProductSpaceOperator(
         [[Dx, 0],
          [0, Dy],
          [0.5 * Dy, 0.5 * Dx],
@@ -262,17 +371,20 @@ def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
         odl.ReductionOperator(G, odl.ScalingOperator(V, -1)),
         E * odl.ComponentProjection(domain, 1)
     )
-
-    f = odl.functionals.ZeroFunctional(domain)
-
-    l2 = 0.5 * odl.functionals.L2NormSquared(A.range).translated(data)
+    
+    # l2 = 0.5 * odl.solvers.L2NormSquared(A.range).translated(data)
+    # NOTE: Avoid ODL's `.translated(data)` quadratic prox (can type-error in 0.8.3).
+    # Same fidelity term 0.5*||Ax - data||^2, but with robust prox_{σ F*}(p) = (p - σ data)/(1+σ).
+    l2 = ShiftedL2NormSquared(A.range, data)
+    
+    f = odl.solvers.ZeroFunctional(domain)
 
     # Use isotropic L1 (ODL's L1Norm on product spaces is "global L1, local L2"
     # as described in your docstring).
-    l1_1 = 0.5 * alpha * odl.functionals.L1Norm(V)      # ||Gx - y||_1
-    l1_2 = 0.5 * alpha * beta * odl.functionals.L1Norm(W)  # ||E y||_1
+    l1_1 = 0.5 * alpha * odl.solvers.L1Norm(V)      # ||Gx - y||_1
+    l1_2 = 0.5 * alpha * beta * odl.solvers.L1Norm(W)  # ||E y||_1
 
-    g = odl.functionals.SeparableSum(l2, l1_1, l1_2)
+    g = odl.solvers.SeparableSum(l2, l1_1, l1_2)
 
     # Step sizes
     if op_norm is None:
@@ -284,7 +396,7 @@ def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
     if sigma is None:
         sigma = 1.0 / op_norm
 
-    z = domain.zero()
+    z = op.domain.zero()
     if x0 is not None:
         z[0] = x0
     if y0 is not None:
@@ -294,6 +406,40 @@ def solve_tgv2(A, data, alpha=4e-1, beta=1.0, niter=200, x0=None, y0=None,
     return z[0], z[1]
         
     
+# Make the SIAC penalty in L1 for testing difference
+def solve_siac_L1(A, data, alpha, moments=2, BSorder=2, niter=300,
+                  x0=None, callback=None, tau=None, sigma=None, op_norm=None):
+    X = A.domain
+
+    # SIAC operator K and residual operator B = I - K
+    K = make_siac_operator_odl(space=X, moments=moments, BSorder=BSorder)
+    B = odl.IdentityOperator(X) - K
+
+    # Fidelity on A x in A.range (no translated quadratic issues)
+    l2 = ShiftedL2NormSquared(A.range, data)
+
+    # L1 penalty on Bx, i.e. g2(z2) = alpha * ||z2||_1
+    l1 = 0.5 * alpha * odl.solvers.L1Norm(X)
+
+    # g(z1, z2) = l2(z1) + l1(z2), with z1 = A x, z2 = B x
+    g = odl.solvers.SeparableSum(l2, l1)
+    op = odl.BroadcastOperator(A, B)
+
+    # no extra primal term
+    f = odl.solvers.ZeroFunctional(X)
+
+    # Step sizes
+    if op_norm is None:
+        op_norm = 1.1 * odl.power_method_opnorm(op)
+    if tau is None:
+        tau = 1.0 / op_norm
+    if sigma is None:
+        sigma = 1.0 / op_norm
+
+    x = X.zero() if x0 is None else x0.copy()
+
+    odl.solvers.pdhg(x, f, g, op, niter=niter, tau=tau, sigma=sigma, callback=callback)
+    return x
     
 # We build a function searching for good alpha values using
 # the Morozovs discrepency principle since the data is synthetic

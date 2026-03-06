@@ -440,6 +440,115 @@ def solve_siac_L1(A, data, alpha, moments=2, BSorder=2, niter=300,
 
     odl.solvers.pdhg(x, f, g, op, niter=niter, tau=tau, sigma=sigma, callback=callback)
     return x
+
+def solve_siac_grad(A, data, alpha=1e-2, moments=2, BSorder=2, niter=200,
+                  x0=None, isotropic=True, grad_method="forward",
+                  pad_mode="symmetric", tau=None, sigma=None,
+                  op_norm=None, callback=None):
+    r"""
+    Solve a SIAC-filtered TV-type least-squares problem using PDHG:
+
+        min_x  0.5 ||A x - data||_2^2
+            + 0.5 alpha ||(I - K) ∇x||_1,
+
+    where K is a SIAC smoothing operator applied componentwise to the
+    gradient field ∇x.
+
+    Thus, instead of penalizing the gradient directly as in standard TV,
+    this model penalizes the non-SIAC-reproduced part of the gradient.
+    In other words, oscillatory / non-polynomial components of the gradient
+    are penalized, while gradient fields locally reproduced by the SIAC
+    kernel are less penalized.
+
+    Two variants are supported:
+
+    • isotropic SIAC-TV:
+        sum_i sqrt( ((I-K)D_x x)_i^2 + ((I-K)D_y x)_i^2 )
+
+    • anisotropic SIAC-TV:
+        sum_i ( |((I-K)D_x x)_i| + |((I-K)D_y x)_i| )
+
+    Parameters
+    ----------
+    A : odl.Operator
+        Forward operator.
+    data : element of A.range
+        Measured data.
+    alpha : float
+        Regularization parameter.
+    moments : int
+        Number of enforced SIAC moments.
+    BSorder : int
+        B-spline order used in the SIAC kernel.
+    niter : int
+        Number of PDHG iterations.
+    x0 : element of A.domain, optional
+        Initial guess.
+    isotropic : bool
+        If True, use isotropic SIAC-TV (default).
+        If False, use anisotropic SIAC-TV.
+    grad_method : str
+        Discretization method for the gradient.
+    pad_mode : str
+        Boundary condition for derivatives.
+    tau, sigma : float, optional
+        PDHG step sizes. If None, estimated automatically.
+    op_norm : float, optional
+        Precomputed operator norm.
+    callback : callable, optional
+        ODL callback.
+
+    Returns
+    -------
+    x : element of A.domain
+        Reconstructed solution.
+    """
+    X = A.domain
+    G = odl.Gradient(X, method=grad_method, pad_mode=pad_mode)
+    V = G.range
+
+    # Build scalar SIAC operator on the image space, then apply it
+    # componentwise to the gradient field.
+    K_scalar = make_siac_operator_odl(X, moments=moments, BSorder=BSorder)
+    K_vec = odl.ProductSpaceOperator([[K_scalar, 0],
+                                      [0, K_scalar]])
+    B = 0.5*odl.IdentityOperator(V) - K_vec
+
+    # We form Op(x) = [A x, (I - K) ∇x]
+    op = odl.BroadcastOperator(A, B * G)
+
+    # l2 = 0.5 * odl.solvers.L2NormSquared(A.range).translated(data)
+
+    # NOTE: Avoid ODL's `.translated(data)` quadratic prox (can type-error in 0.8.3).
+    # This is the same data fidelity: 0.5*||Ax - data||^2, but with a safe
+    # closed-form prox of the conjugate.
+    l2 = ShiftedL2NormSquared(A.range, data)
+
+    f = odl.solvers.ZeroFunctional(X)
+
+    # SIAC-filtered TV functional (isotropic or anisotropic)
+    if isotropic:
+        tv = 0.5 * alpha * odl.solvers.GroupL1Norm(V)
+    else:
+        tv = 0.5 * alpha * odl.solvers.L1Norm(V)
+    g = odl.solvers.SeparableSum(l2, tv)
+
+    # Step sizes
+    if op_norm is None:
+        # Estimated operator norm, add 10 percent
+        # to ensure ||Op||_2^2 * sigma * tau < 1
+        op_norm = 1.1 * odl.power_method_opnorm(op)
+    if tau is None:
+        tau = 1.0 / op_norm
+    if sigma is None:
+        sigma = 1.0 / op_norm
+
+    x = op.domain.zero() if x0 is None else x0.copy()
+
+    odl.solvers.pdhg(x, f, g, op, niter=niter,
+                     tau=tau, sigma=sigma, callback=callback)
+
+    return x
     
 # We build a function searching for good alpha values using
 # the Morozovs discrepency principle since the data is synthetic

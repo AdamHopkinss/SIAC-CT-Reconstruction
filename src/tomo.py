@@ -21,7 +21,7 @@ def shepp_logan_2d(space, modified=True):
     return odl.phantom.shepp_logan(space, modified=modified)
 
 def parallel_geom_2d(angular_coverage=(-60, 60), step=1,
-                     det_range=(-1.5, 1.5), det_count=400):
+                     det_range = None, det_count = None):   # det_range=(-1.5, 1.5), det_count=400):
     """
     Create a 2D parallel-beam geometry.
     """

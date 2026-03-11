@@ -167,3 +167,346 @@ def apply_siac_fft_nd(arr: np.ndarray,
 
     return xpad[tuple(crop_slices)]
 
+##____________________________________________________________________________##
+
+##___________________________SIAC_on_Modal_DG_________________________________##
+
+from scipy.interpolate import BSpline
+from numpy.polynomial.legendre import leggauss
+
+from src.dg_stuff import eval_orthonormal_legendre_1d
+from src.dg_stuff import eval_dg_modal_on_img_grid 
+
+def centered_cardinal_bspline(order):
+    """
+    Centered cardinal B-spline of given order.
+    Support: [-order/2, order/2]
+    Integral = 1
+    """
+    degree = order - 1
+    knots = np.arange(order + 1, dtype=float)
+
+    spline = BSpline.basis_element(knots, extrapolate=False)
+    support = (-order / 2, order / 2)
+
+    def B(x):
+        x = np.asarray(x)
+        y = spline(x + order/2)
+        y = np.asarray(y, dtype=float)
+
+        mask = (x < support[0]) | (support[1] < x)
+        if y.ndim == 0:
+            return 0.0 if mask else float(y)
+        y[mask] = 0.0
+        return y
+
+    return B
+
+def build_siac_kernel_1d(cgam, BSorder, gamma_vals):
+    """
+    Returns K(t) = sum_g c_g B(t - gamma_g)
+    in cell units.
+    """
+    B = centered_cardinal_bspline(BSorder)
+
+    def K(t):
+        t = np.asarray(t)
+        out = np.zeros_like(t, dtype=float)
+        for cg, gam in zip(cgam, gamma_vals):
+            out += cg * B(t - gam)
+        return out
+
+    return K
+
+def siac_kernel_support(BSorder, gamma_vals):
+    """
+    Support of K(t) = sum_g c_g B(t-g), where B has support [-BSorder/2, BSorder/2].
+    """
+    a = np.min(gamma_vals) - BSorder / 2.0
+    b = np.max(gamma_vals) + BSorder / 2.0
+    return a, b
+
+def compute_siac_shifts_1d(BSorder, gamma_vals):
+    """
+    Integer element shifts s that can contribute, based on
+    K((xi-eta)/2 - s), with (xi-eta)/2 in [-1,1].
+    """
+    a, b = siac_kernel_support(BSorder, gamma_vals)
+    smin = int(np.ceil(-1.0 - b))
+    smax = int(np.floor(1.0 - a))
+    return np.arange(smin, smax + 1)
+
+def local_pixel_center_nodes(order):
+    """
+    Original pixel centers mapped to [-1,1].
+    """
+    k = np.arange(order)    # array([0,1,...,order-1])
+    return -1.0 + (2.0 * k + 1.0) / order 
+
+def precompute_siac_matrix_1d_modal(kernel, p, eval_nodes, shifts, quad_order=None):
+
+    order = p + 1
+    
+    if quad_order is None:
+        quad_order = max(2 * p + 4, 12)
+
+    # quadrature points eta_l and weights w_l on [-1,1]
+    qx, qw = leggauss(quad_order)
+    # phi_q[m, l] = phi_m(qx[l])
+    phi_q = eval_orthonormal_legendre_1d(qx, p)   # shape (order, quad_order)
+    
+    # A[i, q, m]
+    A = np.zeros((order, len(shifts), order), dtype=float)
+    
+    for i, xi in enumerate(eval_nodes):
+        for q, s in enumerate(shifts):
+            # kernel argument at quadrature points
+            arg = (xi - qx) / 2.0 - s 
+            
+            # evaluate SIAC kernel
+            kvals = kernel(arg)
+            
+            # quadrature weights with factor 1/2
+            weighted_kernel = 0.5 * qw * kvals
+            
+            # integrate against all modal basis functions
+            A[i, q, :] = phi_q @ weighted_kernel
+    
+    return A
+
+def apply_x_pass(coeffs, A, shifts):
+    """
+    Apply the SIAC operator in the x-direction.
+
+    Parameters
+    ----------
+    coeffs : ndarray, shape (Ky, Kx, order, order)
+        Modal DG coefficients:
+            coeffs[ey, ex, my, mx]
+    A : ndarray, shape (order, nshift, order)
+        1D SIAC modal matrix:
+            A[ix, q, mx]
+    shifts : ndarray, shape (nshift,)
+        Integer x-element offsets
+    fill_boundary : bool
+        If True, copy coeffs into untouched boundary region.
+        If False, leave boundary values as zero.
+
+    Returns
+    -------
+    W : ndarray, shape (Ky, Kx, order, order)
+        Intermediate field:
+            W[ey, ex, my, ix]
+        modal in y, evaluated in x
+    x_valid : tuple
+        Valid x-element range (x0, x1), meaning ex in range(x0, x1)
+
+    coeffs shape:   (Ky, Kx, order, order)
+    A shape:        (order, len(shifts), order)
+    
+    fix row ey, fix y-mode my, evaluate at target x-node ix
+    W[ey,ex,my,ix] = sum_{q,mx} A[ix,q,mx] coeffs[ey, ex + sq, my, mx]
+    for shifts s
+    """
+    Ky, Kx, order, _ = coeffs.shape
+    
+    W = np.zeros((Ky, Kx, order, order), dtype=float)
+    
+    smin = shifts.min()
+    smax = shifts.max()
+    
+    x0 = -smin
+    x1 = Kx - smax      # ensure kernel stays internal
+    
+    for ey in range(Ky):            # allow all rows
+        for ex in range(x0, x1):    # only x interior
+            # extract neighbours
+            neigh = coeffs[ey, ex + shifts, :, :]
+            
+            # W_block[my, ix] = sum_{q,mx} neigh[q,my,mx] * A[ix,q,mx]
+            W[ey, ex, :, :] = np.einsum("qym,iqm->yi", neigh, A)
+
+            # for my in range(order):
+            #     for ix in range(order):
+            #         acc = 0.0
+            #         for q, s in enumerate(shifts):
+            #             for mx in range(order):
+            #                 acc += A[ix, q, mx] * coeffs[ey, ex + s, my, mx]
+            #         W[ey, ex, my, ix] = acc
+    
+    # Fill in the untouched values
+    # if fill_boundary:
+    #     # copy unfiltered values on left/right boundary strips
+    #     W[:, :x0, :, :] = coeffs[:, :x0, :, :]
+    #     W[:, x1:, :, :] = coeffs[:, x1:, :, :]
+
+    return W, (x0, x1)
+            
+    
+def apply_y_pass(W, A, shifts):
+    """
+    Apply the SIAC operator in the y-direction.
+
+    Parameters
+    ----------
+    W : ndarray, shape (Ky, Kx, order, order)
+        Intermediate field after x-pass:
+            W[ey, ex, my, ix]
+        modal in y, evaluated in x
+    A : ndarray, shape (order, nshift, order)
+        1D SIAC modal matrix:
+            A[iy, q, my]
+    shifts : ndarray, shape (nshift,)
+        Integer y-element offsets
+    x_valid : tuple or None
+        Valid x-element range (x0, x1) returned from the x-pass.
+        If provided, only this x-interior is processed.
+        If None, all x-columns are processed.
+    fill_boundary : bool
+        If True, copy W into untouched boundary region.
+        If False, leave boundary values as zero.
+
+    Returns
+    -------
+    Ustar : ndarray, shape (Ky, Kx, order, order)
+        Filtered field:
+            Ustar[ey, ex, iy, ix]
+        evaluated in both y and x
+    y_valid : tuple
+        Valid y-element range (y0, y1), meaning ey in range(y0, y1)
+
+    W shape:        (Ky, Kx, order, order)
+    A shape:        (order, len(shifts), order)
+
+    fix column ex, fix x-node ix, evaluate at target y-node iy
+    Ustar[ey,ex,iy,ix] = sum_{q,my} A[iy,q,my] * W[ey + sq, ex, my, ix]
+    for shifts s
+    """
+    Ky, Kx, order, _ = W.shape
+
+    Ustar = np.zeros((Ky, Kx, order, order), dtype=float)
+
+    smin = shifts.min()
+    smax = shifts.max()
+
+    y0 = -smin
+    y1 = Ky - smax      # ensure kernel stays internal
+
+    for ex in range(Kx):            # allow all columns
+        for ey in range(y0, y1):    # only y interior
+            # extract neighbours
+            neigh = W[ey + shifts, ex, :, :]
+
+            # U_block[iy, ix] = sum_{q,my} neigh[q,my,ix] * A[iy,q,my]
+            Ustar[ey, ex, :, :] = np.einsum("qmi,jqm->ji", neigh, A)
+
+            # for iy in range(order):
+            #     for ix in range(order):
+            #         acc = 0.0
+            #         for q, s in enumerate(shifts):
+            #             for my in range(order):
+            #                 acc += A[iy, q, my] * W[ey + s, ex, my, ix]
+            #         Ustar[ey, ex, iy, ix] = acc
+
+    # # Fill in the untouched values
+    # if fill_boundary:
+    #     # copy x-boundary strips from W
+    #     Ustar[:, :x0, :, :] = W[:, :x0, :, :]
+    #     Ustar[:, x1:, :, :] = W[:, x1:, :, :]
+
+    #     # copy y-boundary strips from W
+    #     Ustar[:y0, :, :, :] = W[:y0, :, :, :]
+    #     Ustar[y1:, :, :, :] = W[y1:, :, :, :]
+
+    return Ustar, (y0, y1)
+
+
+def scatter_local_blocks_to_image(Ustar):
+    """
+    Convert local element blocks to a global image.
+
+    Parameters
+    ----------
+    Ustar : ndarray, shape (Ky, Kx, order, order)
+        Local filtered values:
+            Ustar[ey, ex, iy, ix]
+
+    Returns
+    -------
+    img : ndarray, shape (Ky*order, Kx*order)
+        Global image on the original pixel-center grid
+    """
+    Ky, Kx, order_y, order_x = Ustar.shape
+    assert order_y == order_x
+    order = order_y
+
+    img = Ustar.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
+    return img
+
+def apply_siac_modal_dg(dg, moments=None, BSorder=None, fill_boundary=True):
+    """
+    Apply the SIAC filter to a modal DG solution
+    """
+    mesh = dg["mesh"]
+    coeffs = dg["coeffs"]
+    
+    p = mesh["p"]
+    order = mesh["order"]
+    Kx = mesh["Kx"]
+    Ky =  mesh["Ky"]
+    
+    if moments is None:
+        moments = 2 * p
+    if BSorder is None:
+        BSorder = p + 1
+    
+    # reference coordinates [-1,1]
+    # 1. local evaluation nodes (original pixel centers)
+    nodes = local_pixel_center_nodes(order)
+    
+    # 2. Build the kernel 
+    cgam_temp = siac_cgam(moments, BSorder)  # returns only one half
+    RS = int(np.ceil(moments / 2))
+    gamma_vals = np.arange(-RS, RS + 1)
+    cgam = np.array([cgam_temp[abs(g)] for g in gamma_vals], dtype=float)
+    
+    shifts = compute_siac_shifts_1d(BSorder=BSorder, gamma_vals=gamma_vals)
+    kernel = build_siac_kernel_1d(cgam=cgam, BSorder=BSorder, gamma_vals=gamma_vals)
+    
+    # 3. admissibility check
+    halfwidth = max(abs(np.asarray(shifts)))
+    if Kx <= 2 * halfwidth or Ky <= 2 * halfwidth:
+        raise ValueError("SIAC kernel support too wide for DG mesh")
+    
+    # 4. Build the SIAC 1D matrix for modal DG (normalized legendre basis)
+    A = precompute_siac_matrix_1d_modal(kernel=kernel, p=p, eval_nodes=nodes, shifts=shifts)
+    # A.shape = (order, len(shifts), order)
+    
+    # 4. apply in x and y
+    W, x_bounds = apply_x_pass(coeffs=coeffs, A=A, shifts=shifts)
+    Ustar, y_bounds = apply_y_pass(W=W, A=A, shifts=shifts)
+    
+    # 5. scatter the result onto the grid (Ky*(p+1), Kx*(p+1))
+    # Additionally, fill in the invalid range of values with the 
+    # pointwise evaluated DG result from the projection
+    
+    img_siac = scatter_local_blocks_to_image(Ustar)
+    
+    if fill_boundary == True:
+        img_dg = eval_dg_modal_on_img_grid(dg)
+        
+        # invalid range for the SIAC kernel
+        y0, y1 = y_bounds
+        x0, x1 = x_bounds
+        
+        # invalid indices for the SIAC kernel
+        px0 = x0 * order
+        px1 = x1 * order
+        py0 = y0 * order
+        py1 = y1 * order
+        
+        img_out = img_dg.copy()
+        img_out[py0:py1, px0:px1] = img_siac[py0:py1, px0:px1]
+        return img_out
+
+    return img_siac

@@ -167,3 +167,167 @@ def ssim(x: np.ndarray, xtrue: np.ndarray, data_range=None):
         channel_axis=None
     )
 
+
+
+import numpy as np
+import pandas as pd
+
+
+def eval_metrics(
+    image: np.ndarray,
+    truth: np.ndarray | None = None,
+    reference: np.ndarray | None = None,
+    dx: float | None = None,
+    dy: float | None = None,
+    hf_frac: float = 0.6,
+    data_range=None,
+    extra: dict | None = None,
+):
+    """
+    Evaluate metrics for one image.
+
+    Parameters
+    ----------
+    image : ndarray
+        Main image to evaluate.
+    truth : ndarray or None
+        Ground-truth image. If given, compute truth-based metrics.
+    reference : ndarray or None
+        Optional baseline/reference image. If given, compute reference-based metrics.
+    dx, dy : float or None
+        Grid spacings. Needed for gradient_error and highfreq_removed_energy.
+    hf_frac : float
+        High-frequency cutoff fraction for highfreq_removed_energy.
+    data_range : float or None
+        Passed to SSIM. If None, inferred from truth when truth is given.
+    extra : dict or None
+        Optional metadata to include in the returned dictionary.
+
+    Returns
+    -------
+    results : dict
+        Dictionary of metrics and optional metadata.
+    """
+    image = np.asarray(image, dtype=float)
+    results = {}
+
+    if truth is not None:
+        truth = np.asarray(truth, dtype=float)
+
+        results["truth_rel_l2_err"] = rel_l2_err(image, truth)
+        results["truth_ssim"] = ssim(image, truth, data_range=data_range)
+
+        if dx is not None and dy is not None:
+            results["truth_gradient_error"] = gradient_error(image, truth, dx=dx, dy=dy)
+        else:
+            results["truth_gradient_error"] = np.nan
+
+    if reference is not None:
+        reference = np.asarray(reference, dtype=float)
+
+        # Plain relative difference to reference
+        results["ref_rel_l2_err"] = rel_l2_err(image, reference)
+
+        # Energy removed relative to reference
+        # removed_energy(x, y) interprets x as original and y as processed
+        Erem, Erel = removed_energy(reference, image)
+        results["ref_removed_energy_rel"] = Erel
+
+        if dx is not None and dy is not None:
+            Ehf, Ehf_rel_total, Ehf_rel_hf = highfreq_removed_energy(
+                reference, image, dx=dx, dy=dy, frac=hf_frac
+            )
+            results["ref_hf_removed_energy_rel_hf"] = Ehf_rel_hf
+        else:
+            results["ref_hf_removed_energy_rel_hf"] = np.nan
+
+    if extra is not None:
+        results.update(extra)
+
+    return results
+
+
+def build_metrics_table(
+    cases: dict,
+    truth: np.ndarray | None = None,
+    dx: float | None = None,
+    dy: float | None = None,
+    hf_frac: float = 0.6,
+    data_range=None,
+):
+    """
+    Build a metrics table for multiple named cases.
+
+    Parameters
+    ----------
+    cases : dict
+        Dictionary of cases. Each case should look like
+
+        cases = {
+            "FBP-ramp": {
+                "image": ...,
+            },
+            "FBP-cosine": {
+                "image": ...,
+                "reference": ...,
+            },
+            "SIAC(FBP-ramp)": {
+                "image": ...,
+                "reference": ...,
+                "extra": {"method": "SIAC", "filter": "ramp"}
+            },
+            ...
+        }
+
+        Optional per-case keys:
+        - "truth": overrides global truth
+        - "reference": optional reference image
+        - "extra": dict of metadata columns to include
+
+    truth : ndarray or None
+        Global ground truth used unless overridden per case.
+    dx, dy : float or None
+        Grid spacings.
+    hf_frac : float
+        High-frequency cutoff fraction.
+    data_range : float or None
+        Passed to SSIM.
+
+    Returns
+    -------
+    df : pandas.DataFrame
+        Table with one row per case.
+    """
+    rows = []
+
+    for name, case in cases.items():
+        if "image" not in case:
+            raise ValueError(f"Case '{name}' is missing required key 'image'.")
+
+        case_image = case["image"]
+        case_truth = case.get("truth", truth)
+        case_reference = case.get("reference", None)
+        case_extra = dict(case.get("extra", {}))
+        case_extra["name"] = name
+
+        row = eval_metrics(
+            image=case_image,
+            truth=case_truth,
+            reference=case_reference,
+            dx=dx,
+            dy=dy,
+            hf_frac=hf_frac,
+            data_range=data_range,
+            extra=case_extra,
+        )
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # Put name first if present
+    cols = list(df.columns)
+    if "name" in cols:
+        cols = ["name"] + [c for c in cols if c != "name"]
+        df = df[cols]
+
+    return df

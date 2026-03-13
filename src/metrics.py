@@ -1,4 +1,8 @@
 import numpy as np
+import pandas as pd
+
+from skimage.metrics import structural_similarity as ssim_metric
+
 
 
 def removed_energy(x: np.ndarray, y: np.ndarray):
@@ -135,8 +139,6 @@ def highfreq_removed_energy(x: np.ndarray,
     return Erem_hf, Erem_hf_rel_total, Erem_hf_rel_hf
 
 
-from skimage.metrics import structural_similarity as ssim_metric
-
 def ssim(x: np.ndarray, xtrue: np.ndarray, data_range=None):
     """
     Structural Similarity Index (SSIM).
@@ -167,10 +169,58 @@ def ssim(x: np.ndarray, xtrue: np.ndarray, data_range=None):
         channel_axis=None
     )
 
+def gradient_weighted_ssim(
+    image: np.ndarray,
+    truth: np.ndarray,
+    data_range=None,
+    alpha: float = 0.75,
+    sigma: float = 1.0,
+    eps: float = 1e-12,
+    return_maps: bool = False,
+):
+    """
+    Gradient-weighted SSIM using gradient magnitude of the ground truth.
 
+    If return_maps=True, also returns (ssim_map, weight_map).
+    """
+    image = np.asarray(image, dtype=float)
+    truth = np.asarray(truth, dtype=float)
+    
+    if image.shape != truth.shape:
+        raise ValueError("image and truth must have same shape")
 
-import numpy as np
-import pandas as pd
+    if data_range is None:
+        data_range = float(truth.max() - truth.min())
+        if data_range == 0:
+            data_range = 1.0
+
+    # SSIM map
+    _, ssim_map = ssim_metric(image, truth, data_range=data_range, full=True)
+
+    # Ground-truth gradient weights
+    if sigma is not None and sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        truth_for_grad = gaussian_filter(truth, sigma=sigma)
+    else:
+        truth_for_grad = truth
+
+    gy, gx = np.gradient(truth_for_grad)
+    weights = np.sqrt(gx**2 + gy**2) ** alpha
+
+    wsum = weights.sum()
+    if wsum < eps:
+        gw_ssim = float(np.mean(ssim_map))
+        if return_maps:
+            return gw_ssim, ssim_map, weights
+        return gw_ssim
+
+    weights = weights / (wsum + eps)
+    gw_ssim = float(np.sum(weights * ssim_map))
+
+    if return_maps:
+        return gw_ssim, ssim_map, weights
+
+    return gw_ssim
 
 
 def eval_metrics(
@@ -216,7 +266,10 @@ def eval_metrics(
 
         results["truth_rel_l2_err"] = rel_l2_err(image, truth)
         results["truth_ssim"] = ssim(image, truth, data_range=data_range)
-
+        results["truth_gw_ssim"] = gradient_weighted_ssim(
+            image, truth, data_range=data_range
+            )
+        
         if dx is not None and dy is not None:
             results["truth_gradient_error"] = gradient_error(image, truth, dx=dx, dy=dy)
         else:

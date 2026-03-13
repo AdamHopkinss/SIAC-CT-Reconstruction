@@ -218,6 +218,22 @@ def build_siac_kernel_1d(cgam, BSorder, gamma_vals):
 
     return K
 
+def pad_modal_coeffs_2d(coeffs, pad_x, pad_y):
+    """
+    Zero-pad modal DG coefficients in element space
+    
+    Assumes coeffs has shape (Ky, Kx, order, order)
+    """
+    Ky, Kx, order_y, order_x = coeffs.shape
+    
+    out = np.zeros(
+        (Ky + 2*pad_y, Kx + 2*pad_x, order_y, order_x),
+        dtype=coeffs.dtype
+    )
+    out[pad_y:pad_y + Ky, pad_x:pad_x + Kx, :, :] = coeffs
+    return out
+    
+
 def siac_kernel_support(BSorder, gamma_vals):
     """
     Support of K(t) = sum_g c_g B(t-g), where B has support [-BSorder/2, BSorder/2].
@@ -274,7 +290,7 @@ def precompute_siac_matrix_1d_modal(kernel, p, eval_nodes, shifts, quad_order=No
     
     return A
 
-def apply_x_pass(coeffs, A, shifts):
+def apply_x_pass(coeffs, A, shifts, padded=False):
     """
     Apply the SIAC operator in the x-direction.
 
@@ -443,9 +459,23 @@ def scatter_local_blocks_to_image(Ustar):
     img = Ustar.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
     return img
 
-def apply_siac_modal_dg(dg, moments=None, BSorder=None, fill_boundary=True):
+def apply_siac_modal_dg(dg, moments=None, BSorder=None, fill_boundary=False, pad_boundary=True):
     """
-    Apply the SIAC filter to a modal DG solution
+    Apply the SIAC filter to a modal DG solution.
+
+    Parameters
+    ----------
+    dg : dict
+        DG representation with keys "mesh" and "coeffs".
+    moments : int or None
+        Number of reproduced moments. Defaults to 2*p.
+    BSorder : int or None
+        B-spline order. Defaults to p+1.
+    fill_boundary : bool
+        If True, fill any region not covered by SIAC with pointwise DG values.
+    pad_boundary : bool
+        If True, extend the modal element grid with zero-valued ghost elements
+        so that the SIAC kernel can cover the whole original domain, then clip back.
     """
     mesh = dg["mesh"]
     coeffs = dg["coeffs"]
@@ -456,15 +486,14 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, fill_boundary=True):
     Ky =  mesh["Ky"]
     
     if moments is None:
-        moments = 2 * p
+        moments = 2 * p     # Standard choices
     if BSorder is None:
         BSorder = p + 1
     
-    # reference coordinates [-1,1]
-    # 1. local evaluation nodes (original pixel centers)
+    # Local evaluation nodes on reference element [-1,1]
     nodes = local_pixel_center_nodes(order)
     
-    # 2. Build the kernel 
+    # Build SIAC kernel 
     cgam_temp = siac_cgam(moments, BSorder)  # returns only one half
     RS = int(np.ceil(moments / 2))
     gamma_vals = np.arange(-RS, RS + 1)
@@ -473,40 +502,93 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, fill_boundary=True):
     shifts = compute_siac_shifts_1d(BSorder=BSorder, gamma_vals=gamma_vals)
     kernel = build_siac_kernel_1d(cgam=cgam, BSorder=BSorder, gamma_vals=gamma_vals)
     
-    # 3. admissibility check
-    halfwidth = max(abs(np.asarray(shifts)))
-    if Kx <= 2 * halfwidth or Ky <= 2 * halfwidth:
-        raise ValueError("SIAC kernel support too wide for DG mesh")
+    # Kernel half-width measured in element units
+    halfwidth =  (moments + BSorder) / 2
+    pad = int(np.max(np.abs(shifts)))       # number of ghost elements
     
-    # 4. Build the SIAC 1D matrix for modal DG (normalized legendre basis)
+    # print(f"halfwidth = {halfwidth}")
+    # print("pad =", pad)
+    # print("shifts =", shifts)
+    # print("required pad =", max(-shifts.min(), shifts.max()))
+    # print("\nrequired: pad >= max(|shifts|)")
+    
+    # Keep originals for clipping back later
+    orig_Kx, orig_Ky = Kx, Ky
+    orig_coeffs = coeffs
+    
+    # Optional zero-padding in element space
+    if pad_boundary:
+        coeffs = pad_modal_coeffs_2d(coeffs, pad_x=pad, pad_y=pad)
+        
+        mesh_work = mesh.copy()
+        
+        mesh_work["Kx"] = Kx + 2*pad
+        mesh_work["Ky"] = Ky + 2*pad
+        Kx = mesh_work["Kx"]
+        Ky = mesh_work["Ky"]
+    else:
+        mesh_work = mesh
+        # admissibility check
+        if Kx <= 2 * halfwidth or Ky <= 2 * halfwidth:
+            raise ValueError("SIAC kernel support too wide for DG mesh")
+        
+    # print("coeffs shape:", coeffs.shape)
+    # print("orig_Kx, orig_Ky:", orig_Kx, orig_Ky)
+    # print("pad:", pad)
+    # print("expected: coeffs.shape == (orig_Ky + 2*pad, orig_Kx + 2*pad, order, order)")
+    
+    # Build SIAC 1D modal matrix (normalized legendre basis)
     A = precompute_siac_matrix_1d_modal(kernel=kernel, p=p, eval_nodes=nodes, shifts=shifts)
     # A.shape = (order, len(shifts), order)
     
-    # 4. apply in x and y
+    # # Apply SIAC passes
     W, x_bounds = apply_x_pass(coeffs=coeffs, A=A, shifts=shifts)
+    
+    # print("x_bounds:", x_bounds)
+    # print("original x-range:", (pad, pad + orig_Kx))
+    # print("required: pad >= x_bounds[0], pad + orig_Kx <= x_bounds[1]")
+    
     Ustar, y_bounds = apply_y_pass(W=W, A=A, shifts=shifts)
     
-    # 5. scatter the result onto the grid (Ky*(p+1), Kx*(p+1))
-    # Additionally, fill in the invalid range of values with the 
-    # pointwise evaluated DG result from the projection
+    # print("y_bounds:", y_bounds)
+    # print("original y-range:", (pad, pad + orig_Ky))
+    # print("required: pad >= y_bounds[0], pad + orig_Ky <= y_bounds[1]")
+    # if padded, clip back to original element mesh
     
+    # print("Ustar shape before clipping:", Ustar.shape)
+    if pad_boundary and pad > 0:
+        Ustar = Ustar[
+            pad:-pad,   # y-elements
+            pad:-pad,   # x-elements
+            :, :
+        ]
+    # print("Ustar shape after clipping:", Ustar.shape)
+    # print(f"expected: ({orig_Ky}, {orig_Kx}, {order}, {order})")
+    
+    # Scatter result onto the grid (Ky*(p+1), Kx*(p+1))
     img_siac = scatter_local_blocks_to_image(Ustar)
     
-    if fill_boundary == True:
-        img_dg = eval_dg_modal_on_img_grid(dg)
-        
-        # invalid range for the SIAC kernel
-        y0, y1 = y_bounds
-        x0, x1 = x_bounds
-        
-        # invalid indices for the SIAC kernel
-        px0 = x0 * order
-        px1 = x1 * order
-        py0 = y0 * order
-        py1 = y1 * order
-        
-        img_out = img_dg.copy()
-        img_out[py0:py1, px0:px1] = img_siac[py0:py1, px0:px1]
-        return img_out
+    # No fallback requested
+    if not fill_boundary:
+        return img_siac
 
-    return img_siac
+    # In padded mode, SIAC should already cover everything
+    if pad_boundary:
+        return img_siac
+    
+    # Non-padded -> fallback-to-DG mode
+    img_dg = eval_dg_modal_on_img_grid(dg)
+
+    # valid SIAC range in element indices
+    y0, y1 = y_bounds
+    x0, x1 = x_bounds
+
+    # convert to pixel/image indices
+    px0 = x0 * order
+    px1 = x1 * order
+    py0 = y0 * order
+    py1 = y1 * order
+
+    img_out = img_dg.copy()
+    img_out[py0:py1, px0:px1] = img_siac[py0:py1, px0:px1]
+    return img_out

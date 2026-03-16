@@ -40,7 +40,7 @@ def solve_tikhonov(A, data, alpha, L=None, niter=50, x0=None, callback=None):
     odl.solvers.conjugate_gradient(H, x, b, niter=niter, callback=callback)
     return x
 
-from src.siac import siac_cgam, siac_hat_1d
+from src.siac_fourier import siac_cgam, siac_hat_1d
 
 def make_siac_operator_odl(space, moments=2, BSorder=2):
     r"""

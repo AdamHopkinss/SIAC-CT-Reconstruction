@@ -103,47 +103,6 @@ def eval_orthonormal_legendre_1d(x, p):
     return out
 
 
-def centered_cardinal_bspline(BSorder):
-    """
-    Centered cardinal B-spline of given order.
-
-    Support: [-BSorder/2, BSorder/2]
-    Integral = 1
-    """
-    degree = BSorder - 1
-    knots = np.arange(BSorder + 1, dtype=float)
-    spline = BSpline.basis_element(knots, extrapolate=False)
-    support = (-BSorder / 2, BSorder / 2)
-
-    def B(x):
-        x = np.asarray(x)
-        y = spline(x + BSorder / 2)
-        y = np.asarray(y, dtype=float)
-
-        mask = (x < support[0]) | (x > support[1])
-        if y.ndim == 0:
-            return 0.0 if bool(mask) else float(y)
-        y[mask] = 0.0
-        return y
-
-    return B
-
-
-def eval_orthonormal_legendre_1d(x, p):
-    """
-    Evaluate orthonormal Legendre basis l_0,...,l_p at points x.
-
-    Returns array of shape (p+1, len(x)).
-    """
-    x = np.atleast_1d(np.asarray(x, dtype=float))
-    out = np.zeros((p + 1, x.size))
-
-    for n in range(p + 1):
-        out[n, :] = np.sqrt((2 * n + 1) / 2.0) * eval_legendre(n, x)
-
-    return out
-
-
 def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
     """
     Compute SIAC spline-basis integrals BSInt(mode, cell, node)
@@ -281,27 +240,65 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None):
     cgam = siac_cgam(moments, BSorder)
     
     # Calculate integrals of B-Splines
+    BSInt = grab_integrals(eval_nodes=nodes, 
+                           p=p, 
+                           BSorder=BSorder, 
+                           BSsupport=BSsupport
+                           )
     
-
-    
-    
+    kernellength = int(2*np.ceil((moments + BSorder)/2) + 1)
     # Kernel half-width measured in element units
-    halfwidth =  (moments + BSorder) / 2
+    halfker = int(np.ceil((moments + BSorder)/2))
+    
+    #### SIAC evaluated at nodes
+    SIACmatrix = np.zeros((order, kernellength, order), dtype=float)
+
+    for k in range(order):
+        for igam in range(moments + 1):
+            SIACmatrix[:, igam:igam + BSlen, k] += cgam[igam] * BSInt[:, :, k]
+    
     
     # The original phantom has compact support, so we pad the mesh 
     # with ghost elements where all coefficients are zero
-    pad = int(np.max(np.abs(88888)))       # number of ghost elements
+    pad = halfker + 1           # number of ghost elements, + 1 for safety
     
-    # Keep originals for clipping back later
-    orig_Kx, orig_Ky = Kx, Ky
-    orig_coeffs = coeffs
-    coeffs = pad_modal_coeffs_2d(coeffs, pad_x=pad, pad_y=pad)
+    # pad
+    coeffs_pad = pad_modal_coeffs_2d(coeffs, pad_x=pad, pad_y=pad)
+
+    # Only compute the result for the original size
+    ustar = np.zeros((Ky, Kx, order, order), dtype=float)
+    
+    for ey in range(Ky):
+        for ex in range(Kx):
+            # center in padded array
+            cy = ey + pad
+            cx = ex + pad
+            
+            block = coeffs_pad[
+                cy-halfker : cy+halfker+1,
+                cx-halfker : cx+halfker+1,
+                :,
+                :,
+            ]   # shape (kernellength, kernellength, order, order)
+            
+            for ky in range(order):
+                Sy = SIACmatrix[:, :, ky]   # (order, kernellength)
+                for kx in range(order):
+                    Sx = SIACmatrix[:, :, kx]   # (order, kernellength)
+                    
+                    val = 0.0
+                    for ry in range(kernellength):
+                        for rx in range(kernellength):
+                            for my in range(order):
+                                for mx in range(order):
+                                    val += (
+                                        Sy[my, ry] * Sx[mx, rx]
+                                        * block[ry, rx, my, mx]
+                                            )
+                    #val = np.einsum('mr,ns,rsmn->', Sy, Sx, block)
+                    ustar[ey, ex, ky, kx] = val
         
-    mesh_work = mesh.copy()
+    # Scatter result onto the grid (Ky*(p+1), Kx*(p+1))
+    img_siac = ustar.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
     
-    mesh_work["Kx"] = Kx + 2*pad
-    mesh_work["Ky"] = Ky + 2*pad
-    Kx = mesh_work["Kx"]
-    Ky = mesh_work["Ky"]
-    
-    
+    return img_siac

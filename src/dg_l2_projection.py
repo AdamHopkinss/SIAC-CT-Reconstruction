@@ -42,16 +42,87 @@ def make_bilinear_function(arr, xgrid, ygrid, fill_value=0.0):
 
     return f  
 
+import numpy as np
 
-def l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, quad_order=None):
+
+def make_piecewise_constant_function(arr, xgrid, ygrid, fill_value=0.0):
+    """
+    Returns a callable f(x, y) that interprets arr as piecewise constant
+    over pixel cells centered at (xgrid, ygrid).
+
+    Outside the pixel-cell domain, returns fill_value.
+
+    Parameters
+    ----------
+    arr : ndarray, shape (len(ygrid), len(xgrid))
+        Pixel values.
+    xgrid, ygrid : ndarray
+        Pixel-center coordinates, assumed uniform.
+    fill_value : float
+        Value returned outside the covered pixel support.
+    """
+    arr = np.asarray(arr)
+    xgrid = np.asarray(xgrid)
+    ygrid = np.asarray(ygrid)
+
+    if arr.shape != (len(ygrid), len(xgrid)):
+        raise ValueError("arr shape must be (len(ygrid), len(xgrid))")
+
+    if len(xgrid) < 2 or len(ygrid) < 2:
+        raise ValueError("Need at least 2 grid points in each direction.")
+
+    dx = xgrid[1] - xgrid[0]
+    dy = ygrid[1] - ygrid[0]
+
+    # pixel-cell boundaries
+    xmin = xgrid[0] - 0.5 * dx
+    xmax = xgrid[-1] + 0.5 * dx
+    ymin = ygrid[0] - 0.5 * dy
+    ymax = ygrid[-1] + 0.5 * dy
+
+    def f(x, y):
+        x = np.asarray(x)
+        y = np.asarray(y)
+
+        shape = np.broadcast(x, y).shape
+        xb = np.broadcast_to(x, shape)
+        yb = np.broadcast_to(y, shape)
+
+        out = np.full(shape, fill_value, dtype=float)
+
+        mask = (xb >= xmin) & (xb < xmax) & (yb >= ymin) & (yb < ymax)
+
+        if np.any(mask):
+            ix = np.floor((xb[mask] - xmin) / dx).astype(int)
+            iy = np.floor((yb[mask] - ymin) / dy).astype(int)
+
+            # safeguard against roundoff at the upper boundary
+            ix = np.clip(ix, 0, len(xgrid) - 1)
+            iy = np.clip(iy, 0, len(ygrid) - 1)
+
+            out[mask] = arr[iy, ix]
+
+        return out
+
+    return f
+
+def make_sampled_function(arr, xgrid, ygrid, mode="bilinear", fill_value=0.0):
+    if mode == "bilinear":
+        return make_bilinear_function(arr, xgrid, ygrid, fill_value=fill_value)
+    elif mode == "piecewise_constant":
+        return make_piecewise_constant_function(arr, xgrid, ygrid, fill_value=fill_value)
+    else:
+        raise ValueError(f'mode must be either "bilinear" or "piecewise_constant", mode given: {mode}')
+    
+def l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, mode="bilinear", quad_order=None):
     Kx, Ky, p = mesh["Kx"], mesh["Ky"], mesh["p"]
     x_edges, y_edges = mesh["x_edges"], mesh["y_edges"]
     
     if quad_order is None:
-        quad_order = max(p + 2, 6)
-    # Create a function f(x,y) from the pixel grid, defined by the bilinear interpolator (callable)
-    f = make_bilinear_function(arr, xgrid=xgrid, ygrid=ygrid)
-    
+        quad_order = max(2*p + 4, 8)
+
+    f = make_sampled_function(arr, xgrid, ygrid, mode, fill_value=0.0)
+
     rq, wq = leggauss(quad_order)
     sq, vq = leggauss(quad_order)
     
@@ -92,7 +163,7 @@ def l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, quad_order=None):
             }
 
 
-def l2_project_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3):
+def l2_project_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3, mode="bilinear"):
     """
     Project reconstruction data onto a DG(Q^p) space on a uniform mesh.
     """
@@ -107,7 +178,7 @@ def l2_project_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3):
     xgrid, ygrid, dx, dy = build_image_grid(DOF_x, DOF_y, xlim=xlim, ylim=ylim)
     mesh = build_dg_mesh(DOF_x, DOF_y, xlim=xlim, ylim=ylim, deg=deg)
 
-    dg = l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh)
+    dg = l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, mode)
 
     # Optional metadata
     dg["xgrid"] = xgrid

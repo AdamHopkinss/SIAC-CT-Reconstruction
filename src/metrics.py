@@ -231,7 +231,8 @@ def eval_metrics(
     dy: float | None = None,
     hf_frac: float = 0.6,
     data_range=None,
-    extra: dict | None = None,
+    clip_range=None,
+    extra: dict | None = None
 ):
     """
     Evaluate metrics for one image.
@@ -250,6 +251,8 @@ def eval_metrics(
         High-frequency cutoff fraction for highfreq_removed_energy.
     data_range : float or None
         Passed to SSIM. If None, inferred from truth when truth is given.
+    clip_range: float or None
+        optionally clips the images, to e.g., the range (0, 1)
     extra : dict or None
         Optional metadata to include in the returned dictionary.
 
@@ -259,6 +262,9 @@ def eval_metrics(
         Dictionary of metrics and optional metadata.
     """
     image = np.asarray(image, dtype=float)
+    
+    if clip_range is not None:
+        image = np.clip(image, clip_range[0], clip_range[1])
     results = {}
 
     if truth is not None:

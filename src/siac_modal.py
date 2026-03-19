@@ -110,7 +110,7 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
 
     Parameters
     ----------
-    eval_nodes : array_like, shape (p+1,)
+    eval_nodes : array_like, shape (n_eval,)
         Reference evaluation nodes zeta_k in [-1,1].
     p : int
         DG polynomial degree.
@@ -123,12 +123,13 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
 
     Returns
     -------
-    BSInt : ndarray, shape (p+1, BSlen, p+1)
+    BSInt : ndarray, shape (p+1, BSlen, n_eval)
         BSInt[m, j, k] = integral block for mode m,
         support-index j, evaluation-node k.
     """
     eval_nodes = np.asarray(eval_nodes, dtype=float)
     order = p + 1
+    n_eval = len(eval_nodes)
 
     BSmin, BSmax = int(BSsupport[0]), int(BSsupport[1])
     BSlen = BSmax - BSmin + 1
@@ -140,14 +141,12 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
 
     q_ref, w_ref = leggauss(quad_order)
 
-    BIntL = np.zeros((order, BSlen, order))
-    BIntR = np.zeros((order, BSlen, order))
+    BIntL = np.zeros((order, BSlen, n_eval))
+    BIntR = np.zeros((order, BSlen, n_eval))
 
-    for k in range(order):
-        zeta = eval_nodes[k]
+    for k, zeta in enumerate(eval_nodes):
 
-        # Keep your current split for now.
-        # MIGHT WANT TO LOOK HERE FOR ERRORS
+        # keep current splitting logic for now
         xicell = zeta - np.sign(zeta) * np.mod(BSorder, 2)
 
         # Left interval [-1, xicell]
@@ -158,18 +157,22 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
         qR = 0.5 * ((1.0 - xicell) * q_ref + (1.0 + xicell))
         wR = 0.5 * (1.0 - xicell) * w_ref
 
-        phiL = eval_orthonormal_legendre_1d(qL, p)   # shape (order, nq)
-        phiR = eval_orthonormal_legendre_1d(qR, p)
+        phiL = eval_orthonormal_legendre_1d(qL, p)   # (order, nq)
+        phiR = eval_orthonormal_legendre_1d(qR, p)   # (order, nq)
 
         for i in range(BSmin, BSmax + 1):
             j = i - BSmin
 
-            bsL = B(0.5 * (zeta - qL) - i)   # shape (nq,)
-            bsR = B(0.5 * (zeta - qR) - i)   # shape (nq,)
-
-            for m in range(order):
-                BIntL[m, j, k] = 0.5 * np.sum(wL * bsL * phiL[m, :])
-                BIntR[m, j, k] = 0.5 * np.sum(wR * bsR * phiR[m, :])
+            bsL = B(0.5 * (zeta - qL) - i)
+            bsR = B(0.5 * (zeta - qR) - i)
+            
+            # for m in range(order):
+            #     BIntL[m, j, k] = 0.5 * np.sum(wL * bsL * phiL[m, :])
+            #     BIntR[m, j, k] = 0.5 * np.sum(wR * bsR * phiR[m, :])
+            
+            # vectorized in m
+            BIntL[:, j, k] = 0.5 * np.sum(phiL * (wL * bsL)[None, :], axis=1)
+            BIntR[:, j, k] = 0.5 * np.sum(phiR * (wR * bsR)[None, :], axis=1)
 
     BSInt = BIntL + BIntR
     return BSInt
@@ -286,16 +289,21 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None):
                 for kx in range(order):
                     Sx = SIACmatrix[:, :, kx]   # (order, kernellength)
                     
-                    val = 0.0
-                    for ry in range(kernellength):
-                        for rx in range(kernellength):
-                            for my in range(order):
-                                for mx in range(order):
-                                    val += (
-                                        Sy[my, ry] * Sx[mx, rx]
-                                        * block[ry, rx, my, mx]
-                                            )
-                    #val = np.einsum('mr,ns,rsmn->', Sy, Sx, block)
+                    # val = 0.0
+                    # for ry in range(kernellength):
+                    #     for rx in range(kernellength):
+                    #         for my in range(order):
+                    #             for mx in range(order):
+                    #                 val += (
+                    #                     Sy[my, ry] * Sx[mx, rx]
+                    #                     * block[ry, rx, my, mx]
+                    #                         )
+                    # Einstein summation index map:
+                    #   ry -> r, rx -> s, my -> m, mx -> n
+                    #   Sy[my, ry]          ->  Sy[m, r]
+                    #   Sx[mx, rx]          ->  Sx[n, s]
+                    #   block[ry,rx,my,mx]  ->  block[r, s, m, n]
+                    val = np.einsum('mr,ns,rsmn->', Sy, Sx, block)
                     ustar[ey, ex, ky, kx] = val
         
     # Scatter result onto the grid (Ky*(p+1), Kx*(p+1))

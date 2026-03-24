@@ -146,9 +146,16 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
 
     for k, zeta in enumerate(eval_nodes):
 
-        # keep current splitting logic for now
-        xicell = zeta - np.sign(zeta) * np.mod(BSorder, 2)
-
+        # 
+        # xicell = zeta - np.sign(zeta) * np.mod(BSorder, 2)
+        if BSorder % 2 == 0:
+            xicell = zeta
+        else:
+            if zeta <= 0:
+                xicell = zeta + 1.0
+            else:
+                xicell = zeta - 1.0
+        
         # Left interval [-1, xicell]
         qL = 0.5 * ((xicell + 1.0) * q_ref + (xicell - 1.0))
         wL = 0.5 * (xicell + 1.0) * w_ref

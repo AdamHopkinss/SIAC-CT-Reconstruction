@@ -178,7 +178,8 @@ def eval_dg_modal(dg, X, Y, fill_value=0.0):
 
         # Evaluate modal expansion
         Ce = coeffs[ey, ex]   # shape (p+1, p+1)
-        U[k] = np.einsum("ij,i,j->", Ce, lr, ls)
+        # Ce[my, mx], ls[my], lr[mx]
+        U[k] = np.einsum("ij,i,j->", Ce, ls, lr)
 
     return U.reshape(Xb.shape)
 

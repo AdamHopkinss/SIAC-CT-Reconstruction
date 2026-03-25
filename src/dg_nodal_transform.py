@@ -10,29 +10,20 @@
 import numpy as np
 from src.dg_utils import _to_numpy, build_dg_mesh, eval_orthonormal_legendre_1d, build_image_grid
 
-def reference_nodes_equispaced(p):
+def reference_nodes_cell_centers_1d(p):
     """
-    Return the p+1 equispaced reference nodes on [-1, 1].
+    Return the p+1 equispaced cell-center nodes on [-1,1].
 
-    Parameters
-    ----------
-    p : int
-        Polynomial degree.
-
-    Returns
-    -------
-    nodes : ndarray, shape (p+1,)
-        Reference nodes on [-1, 1].
+    These are the midpoints of the p+1 equal subintervals of [-1,1]:
+        r_j = -1 + (2j+1)/(p+1),   j=0,...,p
     """
     if not isinstance(p, int):
         raise TypeError("p must be an integer.")
     if p < 0:
         raise ValueError("p must be nonnegative.")
 
-    if p == 0:
-        return np.array([0.0], dtype=float)
-
-    return np.linspace(-1.0, 1.0, p + 1, dtype=float)
+    j = np.arange(p + 1, dtype=float)
+    return -1.0 + (2.0 * j + 1.0) / (p + 1.0)
     
 def vandermonde_1d(nodes, p):
     """
@@ -49,29 +40,6 @@ def vandermonde_1d(nodes, p):
     V = L.T
     Vinv = np.linalg.inv(V)
     return V, Vinv
-    
-def nodal_to_modal_block(U_block, Vinv):
-    """
-    Convert one local nodal block to modal coefficients.
-
-    Parameters
-    ----------
-    U_block : ndarray, shape (p+1, p+1)
-        Local nodal values on one DG element.
-    Vinv : ndarray, shape (p+1, p+1)
-        Inverse 1D Vandermonde matrix.
-
-    Returns
-    -------
-    A_block : ndarray, shape (p+1, p+1)
-        Local modal coefficients.
-    """
-    U_block = np.asarray(U_block, dtype=float)
-    return Vinv @ U_block @ Vinv.T
-    
-def modal_to_nodal_block(A_block, V):
-    A_block = np.asarray(A_block, dtype=float)
-    return V @ A_block @ V.T
     
 def nodal_image_to_dg(recon, xlim=(-1,1), ylim=(-1,1), deg=3):
     """
@@ -110,7 +78,7 @@ def nodal_image_to_dg(recon, xlim=(-1,1), ylim=(-1,1), deg=3):
     order = mesh["order"]
     
     # Reference nodes and Vandermonde
-    nodes = reference_nodes_equispaced(p)
+    nodes = reference_nodes_cell_centers_1d(p)
     V, Vinv = vandermonde_1d(nodes, p)
     
     coeffs = np.zeros((Ky, Kx, order, order))
@@ -124,10 +92,10 @@ def nodal_image_to_dg(recon, xlim=(-1,1), ylim=(-1,1), deg=3):
             # U_block = arr[yslice, xslice]
             
             # Local nodal block for one element
-            U_block = blocks[ey, ex, :, :]
+            U_block_yx = blocks[ey, ex, :, :]   # (local_y, local_x)
             
             # Convert nodal -> modal
-            A_block = nodal_to_modal_block(U_block, Vinv)
+            A_block = Vinv @ U_block_yx @ Vinv.T
             
             # Assemble
             coeffs[ey, ex, :, :] = A_block
@@ -159,7 +127,7 @@ def eval_dg_modal_on_img_grid_nodal(dg):
     Ky = mesh["Ky"]
     order = mesh["order"]
 
-    nodes = dg.get("nodes_1d", reference_nodes_equispaced(p))
+    nodes = dg.get("nodes_1d", reference_nodes_cell_centers_1d(p))
     V, _ = vandermonde_1d(nodes, p)
 
     blocks = np.zeros((Ky, Kx, order, order), dtype=float)
@@ -167,8 +135,8 @@ def eval_dg_modal_on_img_grid_nodal(dg):
     for ey in range(Ky):
         for ex in range(Kx):
             A_block = coeffs[ey, ex, :, :]
-            U_block = modal_to_nodal_block(A_block, V)
-            blocks[ey, ex, :, :] = U_block
+            U_block_xy = V @ A_block @ V.T
+            blocks[ey, ex, :, :] = U_block_xy # back to (local_y, local_x)
 
     arr = blocks.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
     return arr

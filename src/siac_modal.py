@@ -155,6 +155,7 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
                 xicell = zeta + 1.0
             else:
                 xicell = zeta - 1.0
+        # xicell = zeta
         
         # Left interval [-1, xicell]
         qL = 0.5 * ((xicell + 1.0) * q_ref + (xicell - 1.0))

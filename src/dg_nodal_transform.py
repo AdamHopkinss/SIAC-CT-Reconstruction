@@ -12,10 +12,9 @@ from src.dg_utils import _to_numpy, build_dg_mesh, eval_orthonormal_legendre_1d,
 
 def reference_nodes_cell_centers_1d(p):
     """
-    Return the p+1 equispaced cell-center nodes on [-1,1].
+    Return the p+1 equispaced cell-center nodes on [-1,1]:
 
-    These are the midpoints of the p+1 equal subintervals of [-1,1]:
-        r_j = -1 + (2j+1)/(p+1),   j=0,...,p
+        r_j = -1 + (2j+1)/(p+1),  j=0,...,p
     """
     if not isinstance(p, int):
         raise TypeError("p must be an integer.")
@@ -24,32 +23,39 @@ def reference_nodes_cell_centers_1d(p):
 
     j = np.arange(p + 1, dtype=float)
     return -1.0 + (2.0 * j + 1.0) / (p + 1.0)
-    
+
+
 def vandermonde_1d(nodes, p):
     """
-    Build the Vandermonde matrix V for the orthonormal Legendre basis
-    evaluated at the given nodes.
+    Build the 1D Vandermonde matrix for the orthonormal Legendre basis.
 
     V[i, m] = phi_m(nodes[i])
 
     Returns
     -------
     V : ndarray, shape (p+1, p+1)
+    Vinv : ndarray, shape (p+1, p+1)
     """
-    L = eval_orthonormal_legendre_1d(nodes, p)  # (p+1, p+1)
-    V = L.T
+    V = eval_orthonormal_legendre_1d(nodes, p).T
     Vinv = np.linalg.inv(V)
     return V, Vinv
-    
-def nodal_image_to_dg(recon, xlim=(-1,1), ylim=(-1,1), deg=3):
+
+
+def nodal_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3):
     """
-    Interpret image samples as local nodal DG values and convert them
-    elementwise to modal DG coefficients.
+    Interpret image samples as elementwise nodal values on a tensor-product DG grid
+    and convert them to modal DG coefficients.
+
+    Storage convention
+    ------------------
+    coeffs[ey, ex, my, mx]
+        ey, ex : element indices in y and x
+        my, mx : modal indices in y and x
 
     Parameters
     ----------
-    recon : array-like or ODL element
-        Input image data of shape (DOF_y, DOF_x).
+    recon : array_like
+        Image/sample array of shape (DOF_y, DOF_x).
     xlim, ylim : tuple[float, float]
         Physical domain limits.
     deg : int
@@ -58,67 +64,64 @@ def nodal_image_to_dg(recon, xlim=(-1,1), ylim=(-1,1), deg=3):
     Returns
     -------
     dg : dict
-        DG representation with modal coefficients and mesh metadata.
+        DG representation with mesh, coefficients, and grid metadata.
     """
-    
     arr = _to_numpy(recon)
-    
+
     if arr.ndim != 2:
         raise ValueError("Expected a 2D array/image for recon.")
 
-    # NumPy shape convention: (DOF_y, DOF_x)
     DOF_y, DOF_x = arr.shape
-    
+
     xgrid, ygrid, dx, dy = build_image_grid(DOF_x, DOF_y, xlim=xlim, ylim=ylim)
     mesh = build_dg_mesh(DOF_x, DOF_y, xlim=xlim, ylim=ylim, deg=deg)
-    
+
     p = mesh["p"]
     Kx = mesh["Kx"]
     Ky = mesh["Ky"]
     order = mesh["order"]
-    
-    # Reference nodes and Vandermonde
+
     nodes = reference_nodes_cell_centers_1d(p)
     V, Vinv = vandermonde_1d(nodes, p)
-    
-    coeffs = np.zeros((Ky, Kx, order, order))
-    
-    blocks = arr.reshape(Ky, order, Kx, order).transpose(0, 2, 1, 3) # -> shape: (Ky, Kx, order, order)
+
+    # Reshape global image into local element blocks:
+    # arr[iy, ix] -> blocks[ey, ex, ly, lx]
+    blocks = arr.reshape(Ky, order, Kx, order).transpose(0, 2, 1, 3)
+
+    coeffs = np.zeros((Ky, Kx, order, order), dtype=float)
+
     for ey in range(Ky):
-        # yslice = slice(ey * order, (ey + 1) * order)
         for ex in range(Kx):
-            # xslice = slice(ex * order, (ex + 1) * order)
-            # # Local nodal block for one element
-            # U_block = arr[yslice, xslice]
-            
-            # Local nodal block for one element
-            U_block_yx = blocks[ey, ex, :, :]   # (local_y, local_x)
-            
-            # Convert nodal -> modal
-            A_block = Vinv @ U_block_yx @ Vinv.T
-            
-            # Assemble
-            coeffs[ey, ex, :, :] = A_block
-            
+            U_block_yx = blocks[ey, ex]          # shape (ly, lx)
+            A_block_yx = Vinv @ U_block_yx @ Vinv.T
+            coeffs[ey, ex] = A_block_yx          # shape (my, mx)
+
     dg = {
-        "mesh": mesh, 
+        "mesh": mesh,
         "coeffs": coeffs,
         "basis": "orthonormal_legendre_tensor",
         "construction": "nodal_transform",
         "nodes_1d": nodes,
         "vandermonde_1d": V,
-
+        "xgrid": xgrid,
+        "ygrid": ygrid,
+        "dx": dx,
+        "dy": dy,
     }
-    
-    # Optional metadata
-    dg["xgrid"] = xgrid
-    dg["ygrid"] = ygrid
-    dg["dx"] = dx
-    dg["dy"] = dy
-
     return dg
-    
-def eval_dg_modal_on_img_grid_nodal(dg):
+
+def dg_modal_to_nodal_image(dg):
+    """
+    Reconstruct the original nodal image values from the modal DG coefficients
+    using the same local Vandermonde transform.
+
+    This should roundtrip to machine precision for dg objects created by
+    nodal_image_to_dg.
+
+    Returns
+    -------
+    arr : ndarray, shape (DOF_y, DOF_x)
+    """
     mesh = dg["mesh"]
     coeffs = dg["coeffs"]
 
@@ -134,9 +137,9 @@ def eval_dg_modal_on_img_grid_nodal(dg):
 
     for ey in range(Ky):
         for ex in range(Kx):
-            A_block = coeffs[ey, ex, :, :]
-            U_block_xy = V @ A_block @ V.T
-            blocks[ey, ex, :, :] = U_block_xy # back to (local_y, local_x)
+            A_block_yx = coeffs[ey, ex]      # (my, mx)
+            U_block_yx = V @ A_block_yx @ V.T
+            blocks[ey, ex] = U_block_yx      # (ly, lx)
 
     arr = blocks.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
     return arr

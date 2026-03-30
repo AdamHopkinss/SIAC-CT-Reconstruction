@@ -12,7 +12,7 @@ from scipy.linalg import lu_solve
 
 ##_______________________Helper functions_____________________________________##
 
-def siac_cgam(moments: int, BSorder: int):
+def siac_cgam_fourier(moments: int, BSorder: int):
     """
     Compute the SIAC cosine-series coefficients c_gamma by enforcing
     polynomial reproduction (moment conditions).
@@ -134,7 +134,7 @@ def apply_siac_fft_nd(arr: np.ndarray,
     axes = [ax if ax >= 0 else ax + x.ndim for ax in axes]
 
     # coefficients once
-    cgam = siac_cgam(moments, BSorder)
+    cgam = siac_cgam_fourier(moments, BSorder)
     pad = _siac_support_pad(moments, BSorder)
 
     # Padding is applied ONCE in all dimensions.

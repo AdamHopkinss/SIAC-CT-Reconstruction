@@ -52,6 +52,8 @@ def siac_cgam(moments: int, BSorder: int):
     #solve given LU and B
     cgam = scipy.linalg.lu_solve(Piv, b)
 
+    # Artificially enforce symmetry
+    # cgam_symm = 0.5 * (cgam + cgam[::-1])
     return cgam
 
 def local_pixel_center_nodes(order):

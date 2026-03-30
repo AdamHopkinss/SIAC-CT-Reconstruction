@@ -242,7 +242,7 @@ def apply_siac_modal_dg_local_nodes_1d(dg, moments=None, BSorder=None, eval_node
         for igam in range(moments + 1):
             SIACmatrix[:, igam:igam + BSlen, k] += cgam[igam] * BSInt[:, :, k]
 
-    pad = halfker + 1
+    pad = halfker
     coeffs_pad = pad_modal_coeffs_1d(coeffs, pad)
     
     ustar = np.zeros((K, n_eval), dtype=float)
@@ -263,15 +263,16 @@ def apply_siac_modal_dg_local_nodes_1d(dg, moments=None, BSorder=None, eval_node
         return img_siac, ustar
     return img_siac
 
-def trim_valid_siac_region_1d(arr, n_eval, moments, BSorder, safety_pad=False, return_trim=False):
+def trim_valid_siac_region_1d(arr, n_eval, moments, BSorder, return_trim=False):
     """
     Trim away the boundary region affected by SIAC zero-padding.
     """
     halfker = int(np.ceil((moments + BSorder) / 2))
-    pad = halfker + 1 if safety_pad else halfker
+    pad = halfker
     trim = pad * n_eval
 
     sl = slice(trim, -trim)
     if return_trim:
         return arr[sl], trim
     return arr[sl]
+

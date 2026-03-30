@@ -16,9 +16,49 @@ from scipy.interpolate import RegularGridInterpolator
 from src.dg_utils import (_to_numpy, 
                           build_dg_mesh, 
                           eval_orthonormal_legendre_1d, 
-                          build_image_grid,
-                          eval_dg_modal
+                          build_image_grid
                           )
+
+
+def build_dg_mesh_l2(Kx, Ky, xlim=(-1, 1), ylim=(-1, 1), deg=3, DOF_x=None, DOF_y=None):
+    """
+    Build a uniform tensor-product DG mesh for L2 projection.
+
+    Unlike the nodal-to-modal construction, this mesh is chosen
+    independently of the image resolution.
+    """
+    xmin, xmax = xlim
+    ymin, ymax = ylim
+
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError("Require xlim[1] > xlim[0] and ylim[1] > ylim[0].")
+
+    if Kx <= 0 or Ky <= 0:
+        raise ValueError("Require Kx > 0 and Ky > 0.")
+
+    p = int(deg)
+    if p < 0:
+        raise ValueError("Require deg >= 0.")
+
+    hx = (xmax - xmin) / Kx
+    hy = (ymax - ymin) / Ky
+
+    x_edges = np.linspace(xmin, xmax, Kx + 1)
+    y_edges = np.linspace(ymin, ymax, Ky + 1)
+
+    return {
+        "domain": [xmin, xmax, ymin, ymax],
+        "Kx": Kx,
+        "Ky": Ky,
+        "p": p,
+        "order": p + 1,
+        "x_edges": x_edges,
+        "y_edges": y_edges,
+        "hx": hx,
+        "hy": hy,
+        "DOF_x": DOF_x,
+        "DOF_y": DOF_y,
+    }
 
 
 # Helper function: Create a function f(x,y) from the pixel grid, defined by the bilinear interpolator (callable)
@@ -151,9 +191,9 @@ def l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, mode="bilinear", quad_order
             
             # Integrate in s:  c[j,i] = sum_b Ls[j,b] * A[b,i]
             # (p+1,nq) @ (nq,p+1) -> (p+1,p+1)
-            c_ji = Ls @ A
+            c_ij = Ls @ A
             
-            coeffs[ey, ex, :, :] = c_ji.T  # store as (i,j)
+            coeffs[ey, ex, :, :] = c_ij  # store as (i,j)
             
     return {"mesh": mesh, 
             "coeffs": coeffs, 
@@ -163,7 +203,42 @@ def l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, mode="bilinear", quad_order
             }
 
 
-def l2_project_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3, mode="bilinear"):
+def recommend_l2_mesh(DOF_x, DOF_y, deg, same_in_both=True):
+    """
+    As a practical heuristic, the DG mesh may be chosen so that each element
+    spans at least p + 1 image samples in each coordinate direction, in order to
+    avoid using a DG space that is too fine relative to the sampled data
+    """
+    
+    p = int(deg)
+    if same_in_both:
+        K = min(DOF_x // (p + 1), DOF_y // (p + 1))
+        K = max(K, 1)
+        return K, K
+    else:
+        Kx = max(DOF_x // (p + 1), 1)
+        Ky = max(DOF_y // (p + 1), 1)
+        return Kx, Ky
+    
+    
+# NOTE:
+# The L2 projection does not require the nodal/modal compatibility
+# DOF_x = Kx*(p+1), DOF_y = Ky*(p+1).
+# However, the current SIAC postprocessing routine evaluates the filtered
+# DG field at (p+1) points per element in each direction, so its output
+# is naturally defined on a grid of shape (Ky*(p+1), Kx*(p+1)).
+# Therefore, direct comparison of SIAC output with the original image grid
+# only works when DOF_x = Kx*(p+1) and DOF_y = Ky*(p+1).
+
+def l2_project_image_to_dg(
+    recon,
+    xlim=(-1, 1),
+    ylim=(-1, 1),
+    deg=3,
+    mode="bilinear",
+    Kx=None,
+    Ky=None,
+):
     """
     Project reconstruction data onto a DG(Q^p) space on a uniform mesh.
     """
@@ -172,15 +247,20 @@ def l2_project_image_to_dg(recon, xlim=(-1, 1), ylim=(-1, 1), deg=3, mode="bilin
     if arr.ndim != 2:
         raise ValueError("Expected a 2D array/image for recon.")
 
-    # NumPy shape convention: (DOF_y, DOF_x)
     DOF_y, DOF_x = arr.shape
 
     xgrid, ygrid, dx, dy = build_image_grid(DOF_x, DOF_y, xlim=xlim, ylim=ylim)
-    mesh = build_dg_mesh(DOF_x, DOF_y, xlim=xlim, ylim=ylim, deg=deg)
+
+    if Kx is None:
+        Kx, Ky = recommend_l2_mesh(DOF_x=DOF_x, DOF_y=DOF_y, deg=deg, same_in_both=True)
+
+    mesh = build_dg_mesh_l2(
+        Kx=Kx, Ky=Ky, xlim=xlim, ylim=ylim, deg=deg,
+        DOF_x=DOF_x, DOF_y=DOF_y
+    )
 
     dg = l2_project_pixels_to_dg(arr, xgrid, ygrid, mesh, mode)
 
-    # Optional metadata
     dg["xgrid"] = xgrid
     dg["ygrid"] = ygrid
     dg["dx"] = dx

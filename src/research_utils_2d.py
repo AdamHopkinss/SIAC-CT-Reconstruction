@@ -210,7 +210,7 @@ def apply_siac_modal_dg_local_nodes(dg, moments=None, BSorder=None, eval_nodes=N
     return img_siac
 
 
-def trim_valid_siac_region(arr, n_eval, moments, BSorder, safety_pad=False):
+def trim_valid_siac_region(arr, n_eval, moments, BSorder):
     """
     Trim away the boundary region affected by SIAC zero-padding.
 
@@ -235,7 +235,7 @@ def trim_valid_siac_region(arr, n_eval, moments, BSorder, safety_pad=False):
         Number of grid points removed from each side.
     """
     halfker = int(np.ceil((moments + BSorder) / 2))
-    pad = halfker + 1 if safety_pad else halfker
+    pad = halfker
     trim = pad * n_eval
 
     sl_y = slice(trim, -trim)

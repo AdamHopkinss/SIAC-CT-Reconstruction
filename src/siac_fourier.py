@@ -1,4 +1,5 @@
-# This file contains functions to apply the SIAC filter axis-wise
+# This file contains functions to apply the SIAC filter 
+# axis-wise as a fourier multiplier
 
 import numpy as np
 import math
@@ -9,8 +10,7 @@ from scipy.linalg import lu
 from scipy.linalg import lu_factor
 from scipy.linalg import lu_solve
 
-
-##_______________________Helper functions_____________________________________##
+from src.utils import _to_numpy
 
 def siac_cgam_fourier(moments: int, BSorder: int):
     """
@@ -57,7 +57,6 @@ def siac_cgam_fourier(moments: int, BSorder: int):
     # sumcoeff = sum(cgamtemp[n] for n in np.arange(numspline))
     # print('Sum of coefficients',sumcoeff) 
     return cgam
-    
 
 def siac_hat_1d(omega: np.ndarray, cgam: np.ndarray, BSorder: int, h: float):
     """
@@ -82,20 +81,14 @@ def siac_hat_1d(omega: np.ndarray, cgam: np.ndarray, BSorder: int, h: float):
     
     return sinc_factor * cgamterm
 
-
 def _siac_support_pad(moments: int, BSorder: int) -> int:
-    # mirror your existing heuristic
     R = int(np.ceil((moments + BSorder + 1) / 2))
     return R + 2
-
 
 def _siac_freq_response_1d(N: int, d: float, moments: int, BSorder: int, cgam: np.ndarray):
     omega = 2.0 * np.pi * np.fft.fftfreq(N, d=d)      # radian freq
     S = siac_hat_1d(omega, cgam, BSorder, h=d)        # shape (N,)
     return S
-##____________________________________________________________________________##
-
-##_______________________Main function________________________________________##
 
 def apply_siac_fft_nd(arr: np.ndarray,
                       h_per_axis,
@@ -116,13 +109,13 @@ def apply_siac_fft_nd(arr: np.ndarray,
     axes : int or iterable of int
         Which axes to filter along (e.g. (0,1) for 2D image; (0) for first axis only etc.).
     """
-    x = np.asarray(arr, dtype=float)
+    arr = _to_numpy(arr)
 
     if np.isscalar(h_per_axis):
-        h_per_axis = [float(h_per_axis)] * x.ndim
+        h_per_axis = [float(h_per_axis)] * arr.ndim
     else:
         h_per_axis = list(h_per_axis)
-        if len(h_per_axis) != x.ndim:
+        if len(h_per_axis) != arr.ndim:
             raise ValueError("h_per_axis must be scalar or length arr.ndim")
 
     # normalize axes
@@ -131,7 +124,7 @@ def apply_siac_fft_nd(arr: np.ndarray,
     else:
         axes = list(axes)
 
-    axes = [ax if ax >= 0 else ax + x.ndim for ax in axes]
+    axes = [ax if ax >= 0 else ax + arr.ndim for ax in axes]
 
     # coefficients once
     cgam = siac_cgam_fourier(moments, BSorder)
@@ -139,8 +132,8 @@ def apply_siac_fft_nd(arr: np.ndarray,
 
     # Padding is applied ONCE in all dimensions.
     # If padding in the axes loop, then the second padding can be affected by the first SIAC result (not relevant if SIAC applied to one axis only)
-    pad_width = [(pad, pad)] * x.ndim
-    xpad = np.pad(x, pad_width, mode=pad_mode)
+    pad_width = [(pad, pad)] * arr.ndim
+    xpad = np.pad(arr, pad_width, mode=pad_mode)
 
     # apply along each requested axis
     for ax in axes:
@@ -160,9 +153,52 @@ def apply_siac_fft_nd(arr: np.ndarray,
 
     # crop once
     crop_slices = []
-    for ax in range(x.ndim):
+    for ax in range(arr.ndim):
         start = pad
-        stop  = pad + x.shape[ax]
+        stop  = pad + arr.shape[ax]
         crop_slices.append(slice(start, stop))
 
     return xpad[tuple(crop_slices)]
+
+
+#### Function to create costom ODL admissible filter ####
+
+def siac_filter_odl(moments, BSorder, include_ramp=True):
+    """
+    Return an ODL-compatible frequency filter callable.
+
+    Parameters
+    ----------
+    moments : int
+        Polynomial reproduction order (even).
+    BSorder : int
+        B-spline order.
+    include_ramp : bool, optional
+        If True (default), return t * K̂(t) (FBP-style windowed ramp).
+        If False, return K̂(t) only (pure SIAC window).
+    """
+    cgam = siac_cgam_fourier(moments, BSorder)
+
+    def filt(t):
+        t = np.asarray(t, dtype=float)
+        t = np.clip(t, 0.0, 1.0)
+
+        # Dimensionless frequency
+        w = np.pi * t
+
+        # Cosine series
+        cterm = cgam[0] * np.ones_like(w)
+        for gamma in range(1, len(cgam)):
+            cterm += 2.0 * cgam[gamma] * np.cos(gamma * w)
+
+        # B-spline factor
+        sinc_term = np.sinc(w / (2.0 * np.pi)) ** BSorder
+
+        Khat = sinc_term * cterm
+
+        if include_ramp:
+            return t * Khat   # Ram-Lak x SIAC window
+        else:
+            return Khat #1-Khat       # SIAC window only
+
+    return filt

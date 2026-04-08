@@ -11,8 +11,8 @@ from scipy.interpolate import BSpline
 from numpy.polynomial.legendre import leggauss
 from scipy.special import eval_legendre
 
-
-##_______________________Helper functions_____________________________________##
+from src.basis import eval_orthonormal_legendre_1d
+from src.grid import local_cell_center_nodes_1d
 
 def siac_cgam(moments: int, BSorder: int):
     """
@@ -56,13 +56,6 @@ def siac_cgam(moments: int, BSorder: int):
     # cgam_symm = 0.5 * (cgam + cgam[::-1])
     return cgam
 
-def local_pixel_center_nodes(order):
-    """
-    Original pixel centers mapped to [-1,1].
-    """
-    k = np.arange(order)    # array([0,1,...,order-1])
-    return -1.0 + (2.0 * k + 1.0) / order 
-
 def centered_cardinal_bspline(BSorder):
     """
     Centered cardinal B-spline of given order.
@@ -87,22 +80,6 @@ def centered_cardinal_bspline(BSorder):
         return y
 
     return B
-
-# Helper function: orthonormal Legendre basis values on [-1,1]
-# l_n(r) = sqrt((2n + 1) / 2) * P_n(r)
-def eval_orthonormal_legendre_1d(x, p):
-    """
-    Evaluate orthonormal Legendre basis l_0,...,l_p at points x.
-    
-    Returns array of shape (p+1, len(x)).
-    """
-    x = np.asarray(x)
-    out = np.zeros((p + 1, x.size))
-
-    for n in range(p + 1):
-        out[n, :] = np.sqrt((2*n + 1)/2.0) * eval_legendre(n, x)
-
-    return out
 
 def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
     """
@@ -186,9 +163,126 @@ def grab_integrals(eval_nodes, p, BSorder, BSsupport, quad_order=None):
 
     BSInt = BIntL + BIntR
     return BSInt
-                
-                
-               
+
+
+#### 1D code ####
+def pad_modal_coeffs_1d(coeffs, pad):
+    """
+    Zero-pad modal DG coefficients in element space
+    
+    Assumes coeffs has shape (K, order)
+    """
+    K, order = coeffs.shape
+    
+    out = np.zeros(
+        (K + 2*pad, order), dtype=coeffs.dtype
+        )
+    out[pad:pad + K, :] = coeffs
+    return out
+
+def apply_siac_to_modal_dg_1d(dg, moments=None, BSorder=None, eval_nodes=None, quad_order=None, return_blocks=False):
+    """
+    Apply the SIAC filter to a modal DG solution, evaluated at arbitrary
+    symmetric local reference nodes in each element.
+
+    Parameters
+    ----------
+    dg : dict
+        DG representation with coeffs[e, mode].
+    moments : int or None
+        Number of reproduced moments. Defaults to 2*p.
+    BSorder : int or None
+        B-spline order. Defaults to p+1.
+    eval_nodes : array_like or None
+        Local reference evaluation nodes in [-1,1]. If None, use the original
+        pixel-center nodes of length p+1.
+
+    Returns
+    -------
+    img_siac : ndarray
+        SIAC field on the global grid induced by the local nodes.
+        Shape = (K*n_eval).
+    """  
+    mesh = dg["mesh"]
+    coeffs = dg["coeffs"]
+    
+    p = dg["p"]
+    order = p + 1
+    K = mesh["K"]
+    
+    if moments is None:
+        moments = 2 * p
+    if BSorder is None:
+        BSorder = p + 1
+    
+    if eval_nodes is None:
+        nodes = local_cell_center_nodes_1d(order)
+    else:
+        nodes = np.asarray(eval_nodes, dtype=float)
+    
+    n_eval = len(nodes)
+
+    BSknots = np.linspace(-BSorder / 2, BSorder / 2, BSorder + 1)
+    BSsupport = np.array(
+        [np.floor(BSknots[0]), np.ceil(BSknots[-1])],
+        dtype=int
+    )
+    BSlen = int(BSsupport[1] - BSsupport[0] + 1)
+
+    cgam = siac_cgam(moments, BSorder)
+    
+    BSInt = grab_integrals(
+        eval_nodes=nodes, 
+        p=p, 
+        BSorder=BSorder, 
+        BSsupport=BSsupport, 
+        quad_order=quad_order
+    )   # (order, BSlen, n_eval)
+    
+    kernellength = int(2 * np.ceil((moments + BSorder) / 2) + 1)
+    halfker = int(np.ceil((moments + BSorder) / 2))
+
+    SIACmatrix = np.zeros((order, kernellength, n_eval), dtype=float)
+    
+    for k in range(n_eval):
+        for igam in range(moments + 1):
+            SIACmatrix[:, igam:igam + BSlen, k] += cgam[igam] * BSInt[:, :, k]
+
+    pad = halfker
+    coeffs_pad = pad_modal_coeffs_1d(coeffs, pad)
+    
+    ustar = np.zeros((K, n_eval), dtype=float)
+    
+    for e in range(K):
+        c = e + pad
+        
+        block = coeffs_pad[c - halfker:c + halfker + 1, :]
+        
+        for k in range(n_eval):
+            S = SIACmatrix[:, :, k]
+            # block: (kernellength, order), S: (order, kernellength)
+            ustar[e, k] = np.einsum("mr,rm->", S, block)
+            # ustar[e, k] = np.sum(S * block.T)
+
+    img_siac = ustar.reshape(K * n_eval)
+    if return_blocks:
+        return img_siac, ustar
+    return img_siac
+
+def trim_valid_siac_region_1d(arr, n_eval, moments, BSorder, return_trim=False):
+    """
+    Trim away the boundary region affected by SIAC zero-padding.
+    """
+    halfker = int(np.ceil((moments + BSorder) / 2))
+    pad = halfker
+    trim = pad * n_eval
+
+    sl = slice(trim, -trim)
+    if return_trim:
+        return arr[sl], trim
+    return arr[sl]
+
+#### 2D code ####
 def pad_modal_coeffs_2d(coeffs, pad_x, pad_y):
     """
     Zero-pad modal DG coefficients in element space
@@ -204,8 +298,7 @@ def pad_modal_coeffs_2d(coeffs, pad_x, pad_y):
     out[pad_y:pad_y + Ky, pad_x:pad_x + Kx, :, :] = coeffs
     return out
 
-
-def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
+def apply_siac_modal_dg_2d(dg, moments=None, BSorder=None, eval_nodes=None, quad_order=None):
     """
     Apply the SIAC filter to a modal DG solution.
 
@@ -225,23 +318,20 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
     order = mesh["order"]
     Kx = mesh["Kx"]
     Ky =  mesh["Ky"]
-    hx = mesh["hx"]         # element spacing
-    hy = mesh["hy"]
     
     if moments is None:
         moments = 2 * p     # Standard choices
     if BSorder is None:
         BSorder = p + 1
-    
-    # evaluation grid
-    xgrid = dg["xgrid"]
-    ygrid = dg["ygrid"]
-    dx = dg["dx"]           # physical grid spacings
-    dy = dg["dy"]
-    
+
     
     # reference element
-    nodes = local_pixel_center_nodes(order)
+    if eval_nodes is None:
+        nodes = local_cell_center_nodes_1d(order)
+    else:
+        nodes = np.asarray(eval_nodes, dtype=float)
+    
+    n_eval = len(nodes)
     
     #### Postprocessor ####
     BSknots = np.linspace(-BSorder/2, BSorder/2, BSorder+1)
@@ -253,21 +343,22 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
     cgam = siac_cgam(moments, BSorder)
     
     # Calculate integrals of B-Splines
-    BSInt = grab_integrals(eval_nodes=nodes, 
-                           p=p, 
-                           BSorder=BSorder, 
-                           BSsupport=BSsupport, 
-                           quad_order=quad_order
-                           )
+    BSInt = grab_integrals(
+        eval_nodes=nodes, 
+        p=p, 
+        BSorder=BSorder, 
+        BSsupport=BSsupport, 
+        quad_order=quad_order
+        )   # (order, BSlen, n_eval)
     
     kernellength = int(2*np.ceil((moments + BSorder)/2) + 1)
     # Kernel half-width measured in element units
     halfker = int(np.ceil((moments + BSorder)/2))
     
     #### SIAC evaluated at nodes
-    SIACmatrix = np.zeros((order, kernellength, order), dtype=float)
+    SIACmatrix = np.zeros((order, kernellength, n_eval), dtype=float)
 
-    for k in range(order):
+    for k in range(n_eval):
         for igam in range(moments + 1):
             SIACmatrix[:, igam:igam + BSlen, k] += cgam[igam] * BSInt[:, :, k]
     
@@ -280,7 +371,7 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
     coeffs_pad = pad_modal_coeffs_2d(coeffs, pad_x=pad, pad_y=pad)
 
     # Only compute the result for the original size
-    ustar = np.zeros((Ky, Kx, order, order), dtype=float)
+    ustar = np.zeros((Ky, Kx, n_eval, n_eval), dtype=float)
     
     for ey in range(Ky):
         for ex in range(Kx):
@@ -295,9 +386,9 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
                 :,
             ]   # shape (kernellength, kernellength, order, order)
             
-            for ky in range(order):
+            for ky in range(n_eval):
                 Sy = SIACmatrix[:, :, ky]   # (order, kernellength)
-                for kx in range(order):
+                for kx in range(n_eval):
                     Sx = SIACmatrix[:, :, kx]   # (order, kernellength)
                     
                     # val = 0.0
@@ -318,6 +409,41 @@ def apply_siac_modal_dg(dg, moments=None, BSorder=None, quad_order=None):
                     ustar[ey, ex, ky, kx] = val
         
     # Scatter result onto the grid (Ky*(p+1), Kx*(p+1))
-    img_siac = ustar.transpose(0, 2, 1, 3).reshape(Ky * order, Kx * order)
+    img_siac = ustar.transpose(0, 2, 1, 3).reshape(Ky * n_eval, Kx * n_eval)
     
     return img_siac
+
+def trim_valid_siac_region_2d(arr, n_eval, moments, BSorder, return_trim=False):
+    """
+    Trim away the boundary region affected by SIAC zero-padding.
+
+    Parameters
+    ----------
+    arr : ndarray
+        Global array of shape (Ky*n_eval, Kx*n_eval) or similar.
+    n_eval : int
+        Number of evaluation points per element in each direction.
+    moments : int
+        Number of reproduced moments.
+    BSorder : int
+        B-spline order.
+    safety_pad : bool
+        If True, trim using pad = halfker + 1. Otherwise trim using halfker.
+
+    Returns
+    -------
+    arr_trim : ndarray
+        Interior region.
+    trim : int
+        Number of grid points removed from each side.
+    """
+    halfker = int(np.ceil((moments + BSorder) / 2))
+    pad = halfker
+    trim = pad * n_eval
+
+    sl_y = slice(trim, -trim)
+    sl_x = slice(trim, -trim)
+    
+    if return_trim:   
+        return arr[sl_y, sl_x], trim
+    return arr[sl_y, sl_x]

@@ -3,12 +3,17 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Virtual environment
+# Virtual environments
 venv/
 .venv/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Ignore generated figures
+*.png
+*.pdf
+*.jpg
 
 # Data / outputs
 *.npy
@@ -16,8 +21,17 @@ venv/
 *.h5
 *.mat
 
+# CSV outputs / Monte Carlo results
+*.csv
+
 # OS / editor
 .DS_Store
 .vscode/
 
+# Old folders not to track
+src_OLD/
+notebooks_OLD/
+notebooks_testing_OLD/
+
+# Misc
 Git Help.txt

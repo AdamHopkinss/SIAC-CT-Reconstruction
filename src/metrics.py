@@ -2,7 +2,208 @@ import numpy as np
 import pandas as pd
 
 from skimage.metrics import structural_similarity as ssim_metric
+from scipy.ndimage import (
+    binary_fill_holes,
+    binary_dilation,
+    label,
+    generate_binary_structure,
+)
 
+
+
+def rel_l2_err(x: np.ndarray, xtrue: np.ndarray):
+    """
+    Relative L2 error with respect to ground truth.
+
+    ||x - xtrue||_2 / ||xtrue||_2
+    """
+    return np.linalg.norm(x - xtrue) / np.linalg.norm(xtrue)
+
+
+def phantom_support_mask(truth, tau=1e-8, pad_pixels=2, keep_largest=True):
+    """
+    Build a binary mask for the compact support of the phantom, including
+    interior zero-valued regions, and optionally dilate it by `pad_pixels`.
+
+    Parameters
+    ----------
+    truth : np.ndarray
+        Ground-truth phantom image.
+    tau : float
+        Threshold for deciding initial nonzero support.
+    pad_pixels : int
+        Number of pixel dilations to apply to expand the support.
+    keep_largest : bool
+        If True, keep only the largest connected component before filling/dilation.
+
+    Returns
+    -------
+    mask : np.ndarray of bool
+        Support mask including holes/interior and padding.
+    """
+    truth = np.asarray(truth, dtype=float)
+
+    # Initial support from nonzero values
+    mask0 = np.abs(truth) > tau
+
+    # Optionally keep only the largest connected component
+    if keep_largest:
+        structure = generate_binary_structure(mask0.ndim, 1)
+        lbl, ncomp = label(mask0, structure=structure)
+        if ncomp > 0:
+            sizes = np.bincount(lbl.ravel())
+            sizes[0] = 0  # background
+            largest = sizes.argmax()
+            mask0 = (lbl == largest)
+
+    # Fill interior holes so zero-valued regions inside the phantom are included
+    mask = binary_fill_holes(mask0)
+
+    # Dilate outward by a few pixels
+    if pad_pixels > 0:
+        structure = generate_binary_structure(mask.ndim, 1)
+        mask = binary_dilation(mask, structure=structure, iterations=pad_pixels)
+
+    return mask
+
+def masked_rel_l2_err(
+    x: np.ndarray,
+    xtrue: np.ndarray,
+    mask: np.ndarray | None = None,
+    eps: float = 1e-14,
+):
+    """
+    Masked relative L2 error with respect to the ground truth.
+
+    Computes
+
+        sqrt( sum(M_ij (x_ij - xtrue_ij)^2) / sum(M_ij (xtrue_ij)^2) )
+
+    where M is a binary mask selecting the phantom support.
+    """
+    image = np.asarray(x, dtype=float)
+    truth = np.asarray(xtrue, dtype=float)
+
+    if image.shape != truth.shape:
+        raise ValueError("x and xtrue must have the same shape")
+
+    if mask is None:
+        mask = phantom_support_mask(truth, tau=1e-8, pad_pixels=2)
+    else:
+        mask = np.asarray(mask, dtype=bool)
+
+    if mask.shape != truth.shape:
+        raise ValueError("mask must have the same shape as x and xtrue")
+
+    num = np.sum(((image - truth) ** 2)[mask])
+    den = np.sum((truth ** 2)[mask])
+
+    return np.sqrt(num / (den + eps))
+    
+
+def ssim(x: np.ndarray, xtrue: np.ndarray, data_range=None):
+    """
+    Structural Similarity Index (SSIM).
+
+    Parameters
+    ----------
+    x : ndarray
+        Reconstructed image.
+    xtrue : ndarray
+        Ground truth image.
+    data_range : float or None
+        If None, inferred from xtrue.
+
+    Returns
+    -------
+    float
+        SSIM index in [-1, 1], typically [0, 1].
+    """
+    x = np.asarray(x, dtype=np.float64)
+    xtrue = np.asarray(xtrue, dtype=np.float64)
+
+    if data_range is None:
+        data_range = xtrue.max() - xtrue.min()
+
+    return ssim_metric(
+        xtrue, x,
+        data_range=data_range,
+        channel_axis=None
+    )
+
+
+def gradient_weighted_ssim(
+    image: np.ndarray,
+    truth: np.ndarray,
+    data_range=None,
+    alpha: float = 0.75,
+    sigma: float = 1.0,
+    eps: float = 1e-12,
+    return_maps: bool = False,
+):
+    """
+    Gradient-weighted SSIM using gradient magnitude of the ground truth.
+
+    If return_maps=True, also returns (ssim_map, weight_map).
+    """
+    image = np.asarray(image, dtype=float)
+    truth = np.asarray(truth, dtype=float)
+    
+    if image.shape != truth.shape:
+        raise ValueError("image and truth must have same shape")
+
+    if data_range is None:
+        data_range = float(truth.max() - truth.min())
+        if data_range == 0:
+            data_range = 1.0
+
+    # SSIM map
+    _, ssim_map = ssim_metric(image, truth, data_range=data_range, full=True)
+
+    # Ground-truth gradient weights
+    if sigma is not None and sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        truth_for_grad = gaussian_filter(truth, sigma=sigma)
+    else:
+        truth_for_grad = truth
+
+    gy, gx = np.gradient(truth_for_grad)
+    weights = np.sqrt(gx**2 + gy**2) ** alpha
+
+    wsum = weights.sum()
+    if wsum < eps:
+        gw_ssim = float(np.mean(ssim_map))
+        if return_maps:
+            return gw_ssim, ssim_map, weights
+        return gw_ssim
+
+    weights = weights / (wsum + eps)
+    gw_ssim = float(np.sum(weights * ssim_map))
+
+    if return_maps:
+        return gw_ssim, ssim_map, weights
+
+    return gw_ssim
+
+
+def gradient_error(x: np.ndarray, xtrue: np.ndarray, dx: float, dy: float):
+    """
+    Relative L2 error of the gradient (H1-seminorm error).
+
+    ||grad(x) - grad(xtrue)||_2 / ||grad(xtrue)||_2
+    """
+    # Gradients (order: dy, dx)
+    gx_y, gx_x = np.gradient(x, dy, dx)
+    gt_y, gt_x = np.gradient(xtrue, dy, dx)
+
+    # Gradient difference
+    diff_sq = (gx_x - gt_x)**2 + (gx_y - gt_y)**2
+    true_sq = gt_x**2 + gt_y**2
+
+    num = np.sqrt(np.sum(diff_sq))
+    den = np.sqrt(np.sum(true_sq))
+
+    return num / den
 
 
 def removed_energy(x: np.ndarray, y: np.ndarray):
@@ -28,37 +229,6 @@ def removed_energy(x: np.ndarray, y: np.ndarray):
     Erel = Erem / np.sum(x**2)
     return Erem, Erel
 
-
-def rel_l2_err(x: np.ndarray, xtrue: np.ndarray):
-    """
-    Relative L2 error with respect to ground truth.
-
-    ||x - xtrue||_2 / ||xtrue||_2
-    """
-    return np.linalg.norm(x - xtrue) / np.linalg.norm(xtrue)
-
-
-def gradient_error(x: np.ndarray, xtrue: np.ndarray, dx: float, dy: float):
-    """
-    Relative L2 error of the gradient (H1-seminorm error).
-
-    ||grad(x) - grad(xtrue)||_2 / ||grad(xtrue)||_2
-    """
-    # Gradients (order: dy, dx)
-    gx_y, gx_x = np.gradient(x, dy, dx)
-    gt_y, gt_x = np.gradient(xtrue, dy, dx)
-
-    # Gradient difference
-    diff_sq = (gx_x - gt_x)**2 + (gx_y - gt_y)**2
-    true_sq = gt_x**2 + gt_y**2
-
-    num = np.sqrt(np.sum(diff_sq))
-    den = np.sqrt(np.sum(true_sq))
-
-    return num / den
-
-
-import numpy as np
 
 def highfreq_removed_energy(x: np.ndarray,
                             y: np.ndarray,
@@ -139,90 +309,6 @@ def highfreq_removed_energy(x: np.ndarray,
     return Erem_hf, Erem_hf_rel_total, Erem_hf_rel_hf
 
 
-def ssim(x: np.ndarray, xtrue: np.ndarray, data_range=None):
-    """
-    Structural Similarity Index (SSIM).
-
-    Parameters
-    ----------
-    x : ndarray
-        Reconstructed image.
-    xtrue : ndarray
-        Ground truth image.
-    data_range : float or None
-        If None, inferred from xtrue.
-
-    Returns
-    -------
-    float
-        SSIM index in [-1, 1], typically [0, 1].
-    """
-    x = np.asarray(x, dtype=np.float64)
-    xtrue = np.asarray(xtrue, dtype=np.float64)
-
-    if data_range is None:
-        data_range = xtrue.max() - xtrue.min()
-
-    return ssim_metric(
-        xtrue, x,
-        data_range=data_range,
-        channel_axis=None
-    )
-
-def gradient_weighted_ssim(
-    image: np.ndarray,
-    truth: np.ndarray,
-    data_range=None,
-    alpha: float = 0.75,
-    sigma: float = 1.0,
-    eps: float = 1e-12,
-    return_maps: bool = False,
-):
-    """
-    Gradient-weighted SSIM using gradient magnitude of the ground truth.
-
-    If return_maps=True, also returns (ssim_map, weight_map).
-    """
-    image = np.asarray(image, dtype=float)
-    truth = np.asarray(truth, dtype=float)
-    
-    if image.shape != truth.shape:
-        raise ValueError("image and truth must have same shape")
-
-    if data_range is None:
-        data_range = float(truth.max() - truth.min())
-        if data_range == 0:
-            data_range = 1.0
-
-    # SSIM map
-    _, ssim_map = ssim_metric(image, truth, data_range=data_range, full=True)
-
-    # Ground-truth gradient weights
-    if sigma is not None and sigma > 0:
-        from scipy.ndimage import gaussian_filter
-        truth_for_grad = gaussian_filter(truth, sigma=sigma)
-    else:
-        truth_for_grad = truth
-
-    gy, gx = np.gradient(truth_for_grad)
-    weights = np.sqrt(gx**2 + gy**2) ** alpha
-
-    wsum = weights.sum()
-    if wsum < eps:
-        gw_ssim = float(np.mean(ssim_map))
-        if return_maps:
-            return gw_ssim, ssim_map, weights
-        return gw_ssim
-
-    weights = weights / (wsum + eps)
-    gw_ssim = float(np.sum(weights * ssim_map))
-
-    if return_maps:
-        return gw_ssim, ssim_map, weights
-
-    return gw_ssim
-
-
 def eval_metrics(
     image: np.ndarray,
     truth: np.ndarray | None = None,
@@ -232,7 +318,12 @@ def eval_metrics(
     hf_frac: float = 0.6,
     data_range=None,
     clip_range=None,
-    extra: dict | None = None
+    extra: dict | None = None,
+    compute_reference_metrics: bool = True,
+    compute_masked_rel_l2: bool = True,
+    mask: np.ndarray | None = None,
+    mask_pad_pixels: int = 2,
+    mask_tau: float = 1e-8,
 ):
     """
     Evaluate metrics for one image.
@@ -244,17 +335,29 @@ def eval_metrics(
     truth : ndarray or None
         Ground-truth image. If given, compute truth-based metrics.
     reference : ndarray or None
-        Optional baseline/reference image. If given, compute reference-based metrics.
+        Optional baseline/reference image. If given and
+        compute_reference_metrics=True, compute reference-based metrics.
     dx, dy : float or None
         Grid spacings. Needed for gradient_error and highfreq_removed_energy.
     hf_frac : float
         High-frequency cutoff fraction for highfreq_removed_energy.
     data_range : float or None
         Passed to SSIM. If None, inferred from truth when truth is given.
-    clip_range: float or None
-        optionally clips the images, to e.g., the range (0, 1)
+    clip_range : tuple or None
+        Optionally clips the image to e.g. (0, 1).
     extra : dict or None
         Optional metadata to include in the returned dictionary.
+    compute_reference_metrics : bool
+        If True, compute metrics against `reference` when reference is provided.
+    compute_masked_rel_l2 : bool
+        If True, compute masked relative L2 error against truth.
+    mask : ndarray or None
+        Optional precomputed phantom support mask. If None and
+        compute_masked_rel_l2=True, it is built from truth.
+    mask_pad_pixels : int
+        Padding used when building the phantom support mask.
+    mask_tau : float
+        Threshold used when building the phantom support mask.
 
     Returns
     -------
@@ -262,33 +365,53 @@ def eval_metrics(
         Dictionary of metrics and optional metadata.
     """
     image = np.asarray(image, dtype=float)
-    
+
     if clip_range is not None:
         image = np.clip(image, clip_range[0], clip_range[1])
+
     results = {}
 
+    # -------------------------
+    # Truth-based metrics
+    # -------------------------
     if truth is not None:
         truth = np.asarray(truth, dtype=float)
 
-        results["truth_rel_l2_err"] = rel_l2_err(image, truth)
-        results["truth_ssim"] = ssim(image, truth, data_range=data_range)
-        results["truth_gw_ssim"] = gradient_weighted_ssim(
+        results["rel_l2_err"] = rel_l2_err(image, truth)
+        results["ssim"] = ssim(image, truth, data_range=data_range)
+        results["gw_ssim"] = gradient_weighted_ssim(
             image, truth, data_range=data_range
-            )
-        
-        if dx is not None and dy is not None:
-            results["truth_gradient_error"] = gradient_error(image, truth, dx=dx, dy=dy)
-        else:
-            results["truth_gradient_error"] = np.nan
+        )
 
-    if reference is not None:
+        if compute_masked_rel_l2:
+            if mask is None:
+                mask_use = phantom_support_mask(
+                    truth, tau=mask_tau, pad_pixels=mask_pad_pixels
+                )
+            else:
+                mask_use = np.asarray(mask, dtype=bool)
+
+            results["masked_rel_l2_err"] = masked_rel_l2_err(
+                image, truth, mask=mask_use
+            )
+        else:
+            results["masked_rel_l2_err"] = np.nan
+
+        if dx is not None and dy is not None:
+            results["gradient_error"] = gradient_error(
+                image, truth, dx=dx, dy=dy
+            )
+        else:
+            results["gradient_error"] = np.nan
+
+    # -------------------------
+    # Reference-based metrics
+    # -------------------------
+    if compute_reference_metrics and (reference is not None):
         reference = np.asarray(reference, dtype=float)
 
-        # Plain relative difference to reference
         results["ref_rel_l2_err"] = rel_l2_err(image, reference)
 
-        # Energy removed relative to reference
-        # removed_energy(x, y) interprets x as original and y as processed
         Erem, Erel = removed_energy(reference, image)
         results["ref_removed_energy_rel"] = Erel
 
@@ -305,7 +428,6 @@ def eval_metrics(
 
     return results
 
-
 def build_metrics_table(
     cases: dict,
     truth: np.ndarray | None = None,
@@ -313,6 +435,7 @@ def build_metrics_table(
     dy: float | None = None,
     hf_frac: float = 0.6,
     data_range=None,
+    compute_reference_metrics: bool = True,
 ):
     """
     Build a metrics table for multiple named cases.
@@ -351,6 +474,8 @@ def build_metrics_table(
         High-frequency cutoff fraction.
     data_range : float or None
         Passed to SSIM.
+    compute_reference_metrics : bool
+        If True, compute reference-based metrics when reference is available.
 
     Returns
     -------
@@ -378,6 +503,7 @@ def build_metrics_table(
             hf_frac=hf_frac,
             data_range=data_range,
             extra=case_extra,
+            compute_reference_metrics=compute_reference_metrics,
         )
         rows.append(row)
 
@@ -390,3 +516,177 @@ def build_metrics_table(
         df = df[cols]
 
     return df
+
+
+### Metric functions for the Monte Carlo simulation ###
+
+def compute_metrics(recon, reference):
+    
+    rel_l2 = rel_l2_err(x=recon, xtrue=reference)
+    masked_rel_l2 = masked_rel_l2_err(x=recon, xtrue=reference)
+    gw_ssim_val = gradient_weighted_ssim(image=recon, truth=reference)
+    ssim_val = ssim(x=recon, xtrue=reference)
+    
+    metric_dict = {
+        "rel_l2_err": rel_l2,
+        "masked_rel_l2_err": masked_rel_l2, 
+        "gw_ssim": gw_ssim_val, 
+        "ssim": ssim_val 
+    }
+    return metric_dict
+    
+
+def summarize_mc_results(
+    results_df,
+    group_cols=None,
+    metric_cols=None,
+):
+    """
+    Summarize Monte Carlo results by computing mean/std for each metric.
+
+    Parameters
+    ----------
+    results_df : pandas.DataFrame
+        Raw Monte Carlo results with one row per run.
+    group_cols : list[str] or None
+        Columns used to define groups. If None, defaults to
+        ["method", "noise_level", "p", "moments", "BSorder"] filtered
+        to those present in the dataframe.
+    metric_cols : list[str] or None
+        Metric columns to summarize. If None, uses all numeric columns
+        excluding standard bookkeeping/group columns.
+
+    Returns
+    -------
+    summary_df : pandas.DataFrame
+        Grouped dataframe with columns like
+        <metric>_mean, <metric>_std, <metric>_min, <metric>_max.
+    """
+    if group_cols is None:
+        candidate_group_cols = ["method", "noise_level", "p", "moments", "BSorder"]
+        group_cols = [c for c in candidate_group_cols if c in results_df.columns]
+
+    if metric_cols is None:
+        exclude = set(group_cols + ["rep", "seed"])
+        metric_cols = [
+            c for c in results_df.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(results_df[c])
+        ]
+
+    agg_dict = {}
+    for col in metric_cols:
+        agg_dict[col] = ["mean", "std", "min", "max"]
+
+    summary = results_df.groupby(group_cols, dropna=False).agg(agg_dict)
+
+    summary.columns = [
+        f"{metric}_{stat}" for metric, stat in summary.columns.to_flat_index()
+    ]
+    summary = summary.reset_index()
+
+    return summary
+
+def select_best_by_noise(
+    summary_df,
+    metric,
+    method_col="method",
+    noise_col="noise_level",
+    minimize=True,
+):
+    """
+    Select the best parameter combination for each method and noise level.
+
+    Parameters
+    ----------
+    summary_df : pandas.DataFrame
+        Summarized MC dataframe.
+    metric : str
+        Base metric name, e.g. "rel_l2_err" or "ssim".
+    method_col : str
+        Method column name.
+    noise_col : str
+        Noise-level column name.
+    minimize : bool
+        If True, selects the smallest mean value.
+        If False, selects the largest mean value.
+
+    Returns
+    -------
+    best_df : pandas.DataFrame
+        One row per method/noise level with the best parameter combination.
+    """
+    mean_col = f"{metric}_mean"
+    if mean_col not in summary_df.columns:
+        raise ValueError(f"Column '{mean_col}' not found in summary_df.")
+
+    grouped = summary_df.groupby([method_col, noise_col], dropna=False)
+
+    idx = grouped[mean_col].idxmin() if minimize else grouped[mean_col].idxmax()
+    best_df = summary_df.loc[idx].sort_values([method_col, noise_col]).reset_index(drop=True)
+
+    return best_df
+
+def select_fixed_params_from_reference_noise(
+    summary_df,
+    metric,
+    reference_noise=0.10,
+    method_col="method",
+    noise_col="noise_level",
+    minimize=True,
+):
+    """
+    Select one fixed parameter setting per method by taking the best
+    configuration at a chosen reference noise level.
+
+    Returns
+    -------
+    fixed_params_df : DataFrame
+        One row per method with the chosen parameter values.
+    """
+    mean_col = f"{metric}_mean"
+    if mean_col not in summary_df.columns:
+        raise ValueError(f"Column '{mean_col}' not found in summary_df.")
+
+    ref_df = summary_df[summary_df[noise_col] == reference_noise].copy()
+    if ref_df.empty:
+        raise ValueError(f"No rows found for reference noise level {reference_noise}.")
+
+    grouped = ref_df.groupby(method_col, dropna=False)
+    idx = grouped[mean_col].idxmin() if minimize else grouped[mean_col].idxmax()
+
+    fixed_params_df = ref_df.loc[idx].copy()
+    fixed_params_df = fixed_params_df.sort_values(method_col).reset_index(drop=True)
+
+    return fixed_params_df
+
+def filter_summary_by_fixed_params(
+    summary_df,
+    fixed_params_df,
+    method_col="method",
+):
+    """
+    Filter summary_df so that, for each method, only the rows matching the
+    chosen fixed parameters remain across all noise levels.
+    """
+    param_cols = [c for c in ["p", "moments", "BSorder"] if c in summary_df.columns]
+
+    filtered_parts = []
+
+    for _, row in fixed_params_df.iterrows():
+        method = row[method_col]
+        subdf = summary_df[summary_df[method_col] == method].copy()
+
+        for col in param_cols:
+            val = row[col]
+
+            if pd.isna(val):
+                subdf = subdf[subdf[col].isna()]
+            else:
+                subdf = subdf[subdf[col] == val]
+
+        filtered_parts.append(subdf)
+
+    filtered_df = pd.concat(filtered_parts, ignore_index=True)
+    filtered_df = filtered_df.sort_values([method_col, "noise_level"]).reset_index(drop=True)
+
+    return filtered_df

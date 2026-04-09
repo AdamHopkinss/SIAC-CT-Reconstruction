@@ -58,9 +58,13 @@ def run_monte_carlo_study(
     results_df : pandas.DataFrame
         Long-form table with one row per Monte Carlo run.
     """
-    param_names = list(method_param_grid.keys())
-    param_lists = [method_param_grid[name] for name in param_names]
-    param_combinations = list(product(*param_lists))
+    if method_param_grid:
+        param_names = list(method_param_grid.keys())
+        param_lists = [method_param_grid[name] for name in param_names]
+        param_combinations = list(product(*param_lists))
+    else:
+        param_names = []
+        param_combinations = [()]
 
     rows = []
 

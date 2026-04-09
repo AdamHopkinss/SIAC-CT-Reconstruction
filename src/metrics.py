@@ -543,27 +543,9 @@ def summarize_mc_results(
 ):
     """
     Summarize Monte Carlo results by computing mean/std for each metric.
-
-    Parameters
-    ----------
-    results_df : pandas.DataFrame
-        Raw Monte Carlo results with one row per run.
-    group_cols : list[str] or None
-        Columns used to define groups. If None, defaults to
-        ["method", "noise_level", "p", "moments", "BSorder"] filtered
-        to those present in the dataframe.
-    metric_cols : list[str] or None
-        Metric columns to summarize. If None, uses all numeric columns
-        excluding standard bookkeeping/group columns.
-
-    Returns
-    -------
-    summary_df : pandas.DataFrame
-        Grouped dataframe with columns like
-        <metric>_mean, <metric>_std, <metric>_min, <metric>_max.
     """
     if group_cols is None:
-        candidate_group_cols = ["method", "noise_level", "p", "moments", "BSorder"]
+        candidate_group_cols = ["family", "method", "noise_level", "p", "moments", "BSorder"]
         group_cols = [c for c in candidate_group_cols if c in results_df.columns]
 
     if metric_cols is None:
@@ -592,6 +574,7 @@ def select_best_by_noise(
     method_col="method",
     noise_col="noise_level",
     minimize=True,
+    exclude_families=None,
 ):
     """
     Select the best parameter combination for each method and noise level.
@@ -609,6 +592,8 @@ def select_best_by_noise(
     minimize : bool
         If True, selects the smallest mean value.
         If False, selects the largest mean value.
+    exclude_families : sequence[str] or None
+        Optional list/tuple of families to exclude before selection.
 
     Returns
     -------
@@ -619,10 +604,15 @@ def select_best_by_noise(
     if mean_col not in summary_df.columns:
         raise ValueError(f"Column '{mean_col}' not found in summary_df.")
 
-    grouped = summary_df.groupby([method_col, noise_col], dropna=False)
+    df = summary_df.copy()
+
+    if exclude_families is not None and "family" in df.columns:
+        df = df[~df["family"].isin(exclude_families)]
+
+    grouped = df.groupby([method_col, noise_col], dropna=False)
 
     idx = grouped[mean_col].idxmin() if minimize else grouped[mean_col].idxmax()
-    best_df = summary_df.loc[idx].sort_values([method_col, noise_col]).reset_index(drop=True)
+    best_df = df.loc[idx].sort_values([method_col, noise_col]).reset_index(drop=True)
 
     return best_df
 
@@ -633,14 +623,32 @@ def select_fixed_params_from_reference_noise(
     method_col="method",
     noise_col="noise_level",
     minimize=True,
+    exclude_families=None,
 ):
     """
     Select one fixed parameter setting per method by taking the best
     configuration at a chosen reference noise level.
 
+    Parameters
+    ----------
+    summary_df : pandas.DataFrame
+        Summarized MC dataframe.
+    metric : str
+        Base metric name.
+    reference_noise : float
+        Noise level at which to choose the fixed parameter set.
+    method_col : str
+        Method column name.
+    noise_col : str
+        Noise-level column name.
+    minimize : bool
+        If True, choose the smallest mean value; otherwise choose the largest.
+    exclude_families : sequence[str] or None
+        Optional families to exclude before selecting.
+
     Returns
     -------
-    fixed_params_df : DataFrame
+    fixed_params_df : pandas.DataFrame
         One row per method with the chosen parameter values.
     """
     mean_col = f"{metric}_mean"
@@ -650,6 +658,9 @@ def select_fixed_params_from_reference_noise(
     ref_df = summary_df[summary_df[noise_col] == reference_noise].copy()
     if ref_df.empty:
         raise ValueError(f"No rows found for reference noise level {reference_noise}.")
+
+    if exclude_families is not None and "family" in ref_df.columns:
+        ref_df = ref_df[~ref_df["family"].isin(exclude_families)]
 
     grouped = ref_df.groupby(method_col, dropna=False)
     idx = grouped[mean_col].idxmin() if minimize else grouped[mean_col].idxmax()
@@ -663,6 +674,7 @@ def filter_summary_by_fixed_params(
     summary_df,
     fixed_params_df,
     method_col="method",
+    noise_col="noise_level",
 ):
     """
     Filter summary_df so that, for each method, only the rows matching the
@@ -686,7 +698,49 @@ def filter_summary_by_fixed_params(
 
         filtered_parts.append(subdf)
 
+    if not filtered_parts:
+        raise ValueError("No rows matched the fixed parameter selections.")
+
     filtered_df = pd.concat(filtered_parts, ignore_index=True)
-    filtered_df = filtered_df.sort_values([method_col, "noise_level"]).reset_index(drop=True)
+    filtered_df = filtered_df.sort_values([method_col, noise_col]).reset_index(drop=True)
 
     return filtered_df
+
+from IPython.display import display
+
+def display_fixed_params(
+    fixed_params_df,
+    metric,
+    exclude_families=("FBP",),
+):
+    """
+    Display the fixed parameter selections chosen at the reference noise level.
+
+    Parameters
+    ----------
+    fixed_params_df : pandas.DataFrame
+        Output from select_fixed_params_from_reference_noise(...).
+    metric : str
+        Base metric name.
+    exclude_families : sequence[str] or None
+        Families to exclude from the display table.
+    """
+    df = fixed_params_df.copy()
+
+    if "family" in df.columns and exclude_families is not None:
+        df = df[~df["family"].isin(exclude_families)]
+
+    cols = []
+    for c in ["family", "method", "p", "moments", "BSorder"]:
+        if c in df.columns:
+            cols.append(c)
+
+    cols += [f"{metric}_mean"]
+    if f"{metric}_std" in df.columns:
+        cols.append(f"{metric}_std")
+
+    display(
+        df[cols]
+        .sort_values("method")
+        .reset_index(drop=True)
+    )

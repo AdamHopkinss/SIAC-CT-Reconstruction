@@ -155,6 +155,19 @@ def save_image_w_zoom(img, save_path, figsize=(5, 5), dpi=300,
 
     return str(save_path), str(zoom_path)
 
+# Naming converntion for known methods
+METHOD_LABELS = {
+    "post_recon_dg_siac": "DG-SIAC",
+    "post_recon_fourier_siac": "Fourier-SIAC",
+    "pre_recon_detector_siac": "Detector-SIAC",
+    "fbp_ramlak": "FBP (Ram-Lak)",
+    "fbp_hann": "FBP (Hann)",
+}
+
+def get_method_label(method):
+    return METHOD_LABELS.get(method, method)
+
+
 
 def plot_mc_metric(
     summary_df,
@@ -181,15 +194,13 @@ def plot_mc_metric(
     noise_col : str
         Column containing noise levels.
     style_cols : list[str] or None
-        Extra parameter columns used to distinguish curves, e.g.
-        ["moments", "BSorder"] or ["p", "moments", "BSorder"].
+        Extra parameter columns used to distinguish curves.
     fixed_filters : dict or None
-        Optional filters applied before plotting, e.g.
-        {"p": 1, "moments": 4}.
+        Optional filters applied before plotting.
     title : str or None
         Plot title.
     ylabel : str or None
-        Y-axis label. Defaults to metric name.
+        Y-axis label.
     show_std : bool
         Whether to show mean ± std as a shaded region.
 
@@ -216,6 +227,19 @@ def plot_mc_metric(
 
     group_cols = [method_col] + style_cols
     grouped = df.groupby(group_cols, dropna=False)
+    
+    benchmark_styles = {
+        "fbp_hann": {
+            "color": "black",
+            "linestyle": "-",
+            "linewidth": 1.6
+        },
+        "fbp_ramlak": {
+            "color": "black",
+            "linestyle": "--",
+            "linewidth": 1.6
+        },
+    }
 
     for key, subdf in grouped:
         subdf = subdf.sort_values(noise_col)
@@ -223,26 +247,58 @@ def plot_mc_metric(
         if not isinstance(key, tuple):
             key = (key,)
 
-        label_parts = []
-        for col, val in zip(group_cols, key):
-            if pd.isna(val):
-                continue
-            label_parts.append(f"{col}={val}")
-        label = ", ".join(label_parts)
+        method_val = subdf[method_col].iloc[0]
+        family_val = subdf["family"].iloc[0] if "family" in subdf.columns else None
+
+        # label_parts = []
+        # for col, val in zip(group_cols, key):
+        #     if pd.isna(val):
+        #         continue
+        #     label_parts.append(f"{col}={val}")
+        # label = ", ".join(label_parts)
 
         x = subdf[noise_col].to_numpy()
         y = subdf[mean_col].to_numpy()
 
-        ax.plot(x, y, marker="o", label=label)
+        color = None
+        linestyle = "-"
+        linewidth = 2.4   # methods of interest thicker
+
+        if family_val == "FBP" and method_val in benchmark_styles:
+            style = benchmark_styles[method_val]
+            color = style["color"]
+            linestyle = style["linestyle"]
+            linewidth = style["linewidth"]
+
+        pretty_label = get_method_label(method_val)
+        line, = ax.plot(
+            x,
+            y,
+            marker="o",
+            label=pretty_label,
+            color=color,
+            linestyle=linestyle,
+            linewidth=linewidth,
+        )
 
         if show_std and std_col in subdf.columns:
             ystd = subdf[std_col].fillna(0.0).to_numpy()
-            ax.fill_between(x, y - ystd, y + ystd, alpha=0.2)
+            fill_color = color if color is not None else line.get_color()
+            fill_alpha = 0.12 if family_val == "FBP" else 0.20
+            ax.fill_between(
+                x,
+                y - ystd,
+                y + ystd,
+                alpha=fill_alpha,
+                color=fill_color,
+            )
 
     ax.set_xlabel("Noise level")
     ax.set_ylabel(ylabel if ylabel is not None else metric)
+
     if title is not None:
         ax.set_title(title)
+
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
@@ -250,42 +306,151 @@ def plot_mc_metric(
     return fig, ax
 
 from IPython.display import display
-def display_best_params(best_df, metric):
-    cols = ["method", "noise_level"]
 
-    for c in ["p", "moments", "BSorder"]:
-        if c in best_df.columns:
+def display_best_params(best_df, metric, exclude_families=("FBP",)):
+    """
+    Display best parameter selections, excluding reference families.
+
+    Parameters
+    ----------
+    best_df : pandas.DataFrame
+        Output from select_best_by_noise(...).
+    metric : str
+        Base metric name.
+    exclude_families : sequence[str]
+        Families to exclude from the parameter table.
+    """
+    df = best_df.copy()
+
+    if "family" in df.columns and exclude_families is not None:
+        df = df[~df["family"].isin(exclude_families)]
+
+    cols = []
+    for c in ["family", "method", "noise_level", "p", "moments", "BSorder"]:
+        if c in df.columns:
             cols.append(c)
 
     cols += [f"{metric}_mean"]
-    if f"{metric}_std" in best_df.columns:
+    if f"{metric}_std" in df.columns:
         cols.append(f"{metric}_std")
 
-    display(best_df[cols].sort_values(["method", "noise_level"]).reset_index(drop=True))
+    display(
+        df[cols]
+        .sort_values(["method", "noise_level"])
+        .reset_index(drop=True)
+    )
+    
+    
+def select_best_by_noise(
+    summary_df,
+    metric,
+    method_col="method",
+    noise_col="noise_level",
+    minimize=True,
+    exclude_families=None,
+):
+    """
+    Select the best parameter combination for each method and noise level.
+
+    Parameters
+    ----------
+    summary_df : pandas.DataFrame
+        Summarized MC dataframe.
+    metric : str
+        Base metric name, e.g. "rel_l2_err" or "ssim".
+    method_col : str
+        Method column name.
+    noise_col : str
+        Noise-level column name.
+    minimize : bool
+        If True, selects the smallest mean value.
+        If False, selects the largest mean value.
+    exclude_families : sequence[str] or None
+        Optional list/tuple of families to exclude before selection.
+
+    Returns
+    -------
+    best_df : pandas.DataFrame
+        One row per method/noise level with the best parameter combination.
+    """
+    mean_col = f"{metric}_mean"
+    if mean_col not in summary_df.columns:
+        raise ValueError(f"Column '{mean_col}' not found in summary_df.")
+
+    df = summary_df.copy()
+
+    if exclude_families is not None and "family" in df.columns:
+        df = df[~df["family"].isin(exclude_families)]
+
+    grouped = df.groupby([method_col, noise_col], dropna=False)
+
+    idx = grouped[mean_col].idxmin() if minimize else grouped[mean_col].idxmax()
+    best_df = df.loc[idx].sort_values([method_col, noise_col]).reset_index(drop=True)
+
+    return best_df
+    
     
 def plot_selected_param_vs_noise(
     best_df,
     param,
     method_col="method",
     noise_col="noise_level",
+    exclude_families=("FBP",),
     title=None,
     ylabel=None,
 ):
+    """
+    Plot the selected parameter value versus noise level for each method.
+
+    Parameters
+    ----------
+    best_df : pandas.DataFrame
+        Output from select_best_by_noise(...).
+    param : str
+        Parameter column to plot, e.g. "moments", "BSorder", "p".
+    method_col : str
+        Method column name.
+    noise_col : str
+        Noise-level column name.
+    exclude_families : sequence[str] or None
+        Families to exclude from the plot.
+    title : str or None
+        Plot title.
+    ylabel : str or None
+        Y-axis label.
+
+    Returns
+    -------
+    fig, ax : matplotlib figure and axis
+    """
+    df = best_df.copy()
+
+    if "family" in df.columns and exclude_families is not None:
+        df = df[~df["family"].isin(exclude_families)]
+
+    if param not in df.columns:
+        raise ValueError(f"Column '{param}' not found in best_df.")
+
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    for method, subdf in best_df.groupby(method_col, dropna=False):
+    for method, subdf in df.groupby(method_col, dropna=False):
         subdf = subdf.sort_values(noise_col)
 
         x = subdf[noise_col].to_numpy()
         y = subdf[param].to_numpy()
 
         mask = ~pd.isna(y)
-        ax.plot(x[mask], y[mask], marker="o", label=method)
+        
+        pretty_label = get_method_label(method)
+        if np.any(mask):
+            ax.plot(x[mask], y[mask], marker="o", linewidth=2.0, label=pretty_label)
 
     ax.set_xlabel("Noise level")
     ax.set_ylabel(ylabel if ylabel is not None else param)
+
     if title is not None:
         ax.set_title(title)
+
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
@@ -304,6 +469,7 @@ def plot_param_heatmap(
     title=None,
     cmap="viridis",
     mark_best=True,
+    minimize=True,
 ):
     val_col = f"{metric}_mean"
     if val_col not in summary_df.columns:
@@ -332,6 +498,7 @@ def plot_param_heatmap(
 
     ax.set_xlabel(x_col)
     ax.set_ylabel(y_col)
+
     if title is not None:
         ax.set_title(title)
 
@@ -346,10 +513,16 @@ def plot_param_heatmap(
 
     if mark_best:
         vals = pivot.values.astype(float)
-        idx = np.nanargmin(vals)
+        idx = np.nanargmin(vals) if minimize else np.nanargmax(vals)
         i_best, j_best = np.unravel_index(idx, vals.shape)
-        rect = plt.Rectangle((j_best - 0.5, i_best - 0.5), 1, 1,
-                             fill=False, edgecolor="red", linewidth=2)
+        rect = plt.Rectangle(
+            (j_best - 0.5, i_best - 0.5),
+            1,
+            1,
+            fill=False,
+            edgecolor="red",
+            linewidth=2,
+        )
         ax.add_patch(rect)
 
     plt.tight_layout()
@@ -361,17 +534,25 @@ def compare_fixed_vs_retuned(
     metric,
     method_col="method",
     noise_col="noise_level",
+    exclude_families=("FBP",),
     title=None,
     ylabel=None,
 ):
     mean_col = f"{metric}_mean"
     std_col = f"{metric}_std"
 
+    df_r = retuned_df.copy()
+    df_f = fixed_df.copy()
+
+    if "family" in df_r.columns and exclude_families is not None:
+        df_r = df_r[~df_r["family"].isin(exclude_families)]
+        df_f = df_f[~df_f["family"].isin(exclude_families)]
+
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
-    for method in sorted(retuned_df[method_col].dropna().unique()):
-        sub_retuned = retuned_df[retuned_df[method_col] == method].sort_values(noise_col)
-        sub_fixed = fixed_df[fixed_df[method_col] == method].sort_values(noise_col)
+    for method in sorted(df_r[method_col].dropna().unique()):
+        sub_retuned = df_r[df_r[method_col] == method].sort_values(noise_col)
+        sub_fixed = df_f[df_f[method_col] == method].sort_values(noise_col)
 
         x_r = sub_retuned[noise_col].to_numpy()
         y_r = sub_retuned[mean_col].to_numpy()
@@ -379,21 +560,34 @@ def compare_fixed_vs_retuned(
         x_f = sub_fixed[noise_col].to_numpy()
         y_f = sub_fixed[mean_col].to_numpy()
 
-        ax.plot(x_r, y_r, marker="o", label=f"{method} (retuned)")
-        ax.plot(x_f, y_f, marker="s", linestyle="--", label=f"{method} (fixed @ 0.10)")
+        # Retuned (solid)
+        pretty_label = get_method_label(method)
+        line, = ax.plot(x_r, y_r, marker="o", linewidth=2.4, label=f"{pretty_label} (retuned)")
+
+        # Fixed (dashed, same color)
+        ax.plot(
+            x_f, y_f,
+            marker="s",
+            linestyle="--",
+            linewidth=2.0,
+            color=line.get_color(),
+            label=f"{pretty_label} (fixed @ 0.10)",
+        )
 
         if std_col in sub_retuned.columns:
             ystd_r = sub_retuned[std_col].fillna(0.0).to_numpy()
-            ax.fill_between(x_r, y_r - ystd_r, y_r + ystd_r, alpha=0.15)
+            ax.fill_between(x_r, y_r - ystd_r, y_r + ystd_r, alpha=0.15, color=line.get_color())
 
         if std_col in sub_fixed.columns:
             ystd_f = sub_fixed[std_col].fillna(0.0).to_numpy()
-            ax.fill_between(x_f, y_f - ystd_f, y_f + ystd_f, alpha=0.10)
+            ax.fill_between(x_f, y_f - ystd_f, y_f + ystd_f, alpha=0.10, color=line.get_color())
 
     ax.set_xlabel("Noise level")
     ax.set_ylabel(ylabel if ylabel is not None else metric)
+
     if title is not None:
         ax.set_title(title)
+
     ax.grid(True, alpha=0.3)
     ax.legend()
     plt.tight_layout()
